@@ -2,13 +2,13 @@
 //#include <TM1637TinyDisplayPrivate.h>
 #include <TM1637TinyDisplay.h>
 #include <TimerOne.h>
-// Version 7 - Reset button doing stop
+// Version 8 - Modify manual mode. Add fast forwarding
 
 void(* resetFunc) (void) = 0;//declare reset function at address 0
 
 // The distance between the start and stop position of the platform in mm
-//#define TRAVEL_DISTANCE 180.3 // Nir
-#define TRAVEL_DISTANCE 176.0 // Guy
+#define TRAVEL_DISTANCE 180.3 // Nir
+//#define TRAVEL_DISTANCE 176.0 // Guy
 
 // Number of pins on the motor screw
 #define MOTOR_PINS 12
@@ -55,6 +55,7 @@ void(* resetFunc) (void) = 0;//declare reset function at address 0
 #define NOMINAL_RPM (6.90)
 #define RETURN_RPM (-250.0)
 #define RETURN_RPM_STEP (90.0)
+#define FAST_FORWARD_RPM (150.0)
 #define SETUP_TIMEOUT (8000) // 8 seconds
 #define SETUP_COUNTDOWN_DELAY (3000) // three seconds
 #define RESET_BUTTON_DELAY (2000) // two seconds
@@ -79,7 +80,9 @@ typedef enum {
 typedef enum {
   SETUP_ST = 0,
   RUNNING_ST,
+  FAST_FORWARD_ST,
   RETURN_ST,
+  WAIT_RETURN_ST,
   STOP_ST
 } Platform_state_e;
 
@@ -97,6 +100,7 @@ TM1637TinyDisplay display(CLK, DIO);
 float stepsPerRevolution = 800.0;
 
  // Set the desired rotation speed in RPM
+float Original_targetRPM;
 float targetRPM;
 float returnRPM;
 int returnRPM_setup;
@@ -119,7 +123,7 @@ int buzzerOn;
 
 int EECounter;
 
-unsigned long start_ms, finished_ms, elapsed_ms, timeout_ms, setup_countdown_ms, reset_ms;
+unsigned long start_ms, finished_ms, elapsed_ms, timeout_ms, setup_countdown_ms, reset_ms, fast_forward_ms;
 
 void init_vars()
 {
@@ -162,6 +166,7 @@ void init_vars()
   elapsed_ms = start_ms;
   timeout_ms = 0;
   reset_ms = 0;
+  fast_forward_ms = 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -209,7 +214,7 @@ void setup()
 // so that the motor does not stop while writing to the display
 void runSpeedHook(void)
 {
- if ((Platform_state == RUNNING_ST) || (Platform_state == RETURN_ST))
+ if ((Platform_state == RUNNING_ST) || (Platform_state == RETURN_ST) || (Platform_state == FAST_FORWARD_ST))
     stepper.runSpeed();
 }
 
@@ -349,6 +354,80 @@ void do_setup_loop(void)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+void do_fast_forward_loop(void)
+{
+  //stepper.runSpeed(); // Activate motor
+  float lastRPM = targetRPM;
+
+  // First - test for stop microswitch
+  MicroSwitchStopValue = digitalRead(MicroSwitchStopPin);
+  
+  if (MicroSwitchStopValue == LOW)
+  { // Stop Microswitch pushed
+    buttonStopCount++;
+    if(buttonStopCount == buttonCount)
+    {  // Microswitch stop was met - need to reset platform
+      { // work like in manual mode (Return_policy == MANUAL_RT)
+        digitalWrite (enablePin, HIGH); // Disable motor
+        targetRPM = Original_targetRPM; // Resume normal operation
+        targetSpeed = (returnRPM * stepsPerRevolution) / 60.0;
+        stepper.setSpeed(targetSpeed);
+        Platform_state = WAIT_RETURN_ST;
+        display.showString("push");
+      }
+      buttonStopCount = 0;
+    }
+  }
+  else
+  { // Button released
+    buttonStopCount = 0;
+  }
+
+  if (digitalRead(resetPin) == LOW)
+  {
+      digitalWrite (enablePin, HIGH); // Disable motor
+      targetRPM = Original_targetRPM; // Resume normal operation
+      targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
+      stepper.setSpeed(targetSpeed);
+      Platform_state = STOP_ST;
+      display.showString("rdy");
+  }
+
+  finished_ms = millis();
+  
+  // Print time after timeout
+  if (((finished_ms - timeout_ms) >= DISPLAY_TIMEOUT) && (finished_ms - elapsed_ms >= DISPLAY_DELTA))
+  { // One second has passed. Update display
+    //stepper.runSpeed(); // Activate motor
+    long delta_sec = (finished_ms-start_ms)/1000;
+    if (remainingDistance > 0)
+    { // Print remaining time
+      remainingDistance = remainingDistance - (lastRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
+      float remainingTime = remainingDistance / (targetRPM * (float)MOTOR_PINS/ROD_PINS)*60;
+      delta_sec = remainingTime;
+      if (remainingDistance<0)
+      {
+        remainingDistance = 0;
+        delta_sec = 0;
+        start_ms = finished_ms;
+      }
+    }
+
+
+    // Print passed time
+    long delta_min = delta_sec/60;
+    delta_sec = delta_sec % 60;
+    //stepper.runSpeed(); // Activate motor
+  	display.showNumberDec(delta_min*100+delta_sec,0b01000000, 1);
+
+    //stepper.runSpeed(); // Activate motor
+  	//display.showNumber((long)(finished_ms-start_ms)/1000);
+    //  Serial.println(finished_ms-start_ms);
+    elapsed_ms = finished_ms;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 void do_running_loop(void)
 {
@@ -377,8 +456,8 @@ void do_running_loop(void)
       { // (Return_policy == MANUAL_RT)
         digitalWrite (enablePin, HIGH); // Disable motor
         Serial.println("Motor disabled");
-        Platform_state = STOP_ST;
-        display.showString("rdy");
+        Platform_state = WAIT_RETURN_ST;
+        display.showString("push");
       }
       buttonStopCount = 0;
     }
@@ -405,10 +484,16 @@ void do_running_loop(void)
       { // Only one button is pressed (disregard when both are pressed)
         if (buttonSpeedUpValue == LOW)
         { // Increase speed
+          if (fast_forward_ms == 0)
+          {
+            Original_targetRPM = targetRPM;
+            fast_forward_ms = millis();
+          }
           targetRPM += 0.02;
         }
         else
         { // Decrease speed
+          fast_forward_ms = 0;
           targetRPM -= 0.02;
         }
         timeout_ms = millis(); // This will make the speed apear of the screen for 3 seconds
@@ -420,6 +505,27 @@ void do_running_loop(void)
 
         // Set the desired speed
         stepper.setSpeed(targetSpeed);
+      }
+      else
+      { // Both buttons are pressed - check for fast forwarding
+        if ((fast_forward_ms > 0) && (millis()-fast_forward_ms >= RESET_BUTTON_DELAY))
+        {
+          // Fast forwarding requested
+          Platform_state = FAST_FORWARD_ST;
+          targetRPM = -returnRPM;
+          targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
+          timeout_ms = millis();
+          stepper.setSpeed(targetSpeed);
+          display.showString("ff");
+          tone(buzzerPin,BUZZER_FREQ1,BUZZER_DURATION);
+        }
+      }
+    }
+    else
+    {
+      if (buttonPressedTime_ms == 0)
+      {
+        fast_forward_ms = 0;
       }
     }
   }
@@ -567,6 +673,26 @@ void do_stop_loop(void)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void do_wait_return_loop(void)
+{
+  noTone(buzzerPin); // Just to be sure
+
+  if (read_speed_buttons() == LOW)
+  { // Button is pressed - enable motor
+    digitalWrite (enablePin, LOW); // Enable motor
+    tone(buzzerPin,BUZZER_FREQ1,BUZZER_DURATION);
+    Platform_state = RETURN_ST;
+    targetSpeed = (returnRPM * stepsPerRevolution) / 60.0;
+    remainingDistance = TRAVEL_DISTANCE;
+    timeout_ms = millis();
+    stepper.setSpeed(targetSpeed);
+    display.showString("rtrn");        
+    Serial.println("Motor reversed");
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void loop()
 {  
   switch(Platform_state)
@@ -577,8 +703,14 @@ void loop()
     case RUNNING_ST:
       do_running_loop();
       break;
+    case FAST_FORWARD_ST:
+      do_fast_forward_loop();
+      break;
     case RETURN_ST:
       do_return_loop();
+      break;
+    case WAIT_RETURN_ST:
+      do_wait_return_loop();
       break;
     case STOP_ST:
       do_stop_loop();
