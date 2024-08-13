@@ -7,9 +7,9 @@
 void(* resetFunc) (void) = 0;//declare reset function at address 0
 
 // The distance between the start and stop position of the platform in mm
-//#define TRAVEL_DISTANCE 180.3 // Nir
+#define TRAVEL_DISTANCE 179.87 // Nir
 //#define TRAVEL_DISTANCE 176.0 // Guy
-#define TRAVEL_DISTANCE 155.65 // Renewed
+//#define TRAVEL_DISTANCE 155.65 // Renewed
 #define ERROR_TRAVEL_DISTANCE 2.2
 #define END_ERROR_TRAVEL_DISTANCE 3.0
 
