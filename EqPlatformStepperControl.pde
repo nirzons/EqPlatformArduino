@@ -2,25 +2,56 @@
 //#include <TM1637TinyDisplayPrivate.h>
 #include <TM1637TinyDisplay.h>
 #include <TimerOne.h>
+#include <EEPROM.h>
 // Version 10 - Fix tangent error
 
 void(* resetFunc) (void) = 0;//declare reset function at address 0
 
+//#define SUN_RATE_SUPPORT
+// EEPROM MAP
+#define EP_ADDR_TRAVEL_DISTANCE 0
+
 // The distance between the start and stop position of the platform in mm
-#define TRAVEL_DISTANCE 179.55 // Nir
+#define TRAVEL_DISTANCE 169.50 // Nir
 //#define TRAVEL_DISTANCE 176.0 // Guy
 //#define TRAVEL_DISTANCE 155.65 // Renewed
-#define ERROR_TRAVEL_DISTANCE 2.2
-#define END_ERROR_TRAVEL_DISTANCE 3.0
-
-#define NORTH_ARCH_RADIUS 628.0
-const float half_arch_travel_distance = NORTH_ARCH_RADIUS*atan(TRAVEL_DISTANCE/2/NORTH_ARCH_RADIUS);
-#define SIN_APPROXIMATION_FACTOR 0.99363
+float total_travel_distance;
+#define ERROR_TRAVEL_DISTANCE 2.7
+#define END_ERROR_TRAVEL_DISTANCE 3.5
 
 // Number of pins on the motor screw
 #define MOTOR_PINS 12
 // Number of pins on the rod screw
 #define ROD_PINS 30
+
+#define PUSH_ARCH_RADIUS 634.8
+#define RADIUS_OFFSET 0.05
+float push_arch_radius;
+//float half_arch_travel_distance = PUSH_ARCH_RADIUS*atan(TRAVEL_DISTANCE/2/PUSH_ARCH_RADIUS);
+//float half_arch_travel_distance;
+float angular_velocity;
+// Tracking rates in radians per minute
+#define SIDEREAL_ANGULAR_VELOCITY (0.0043752741) // (2*PI/1436.066667)
+#define SUN_ANGULAR_VELOCITY (0.00436332313) // (2*PI/1440)
+#define MOON_ANGULAR_VELOCITY (0.004489) // Taking into account 13.2 degrees shift per day
+#define SIDEREAL_LINEAR_VELOCITY SIDEREAL_ANGULAR_VELOCITY*PUSH_ARCH_RADIUS
+#define SUN_LINEAR_VELOCITY SUN_ANGULAR_VELOCITY*PUSH_ARCH_RADIUS
+#define MOON_LINEAR_VELOCITY MOON_ANGULAR_VELOCITY*PUSH_ARCH_RADIUS
+#define SIDEREAL_RPM (SIDEREAL_LINEAR_VELOCITY*(float)ROD_PINS/(float)MOTOR_PINS)
+#define SUN_RPM (SUN_LINEAR_VELOCITY*(float)ROD_PINS/(float)MOTOR_PINS)
+#define MOON_RPM (MOON_LINEAR_VELOCITY*(float)ROD_PINS/(float)MOTOR_PINS)
+
+#define ANGULAR_VELOCITY_STEP  (0.000001)  // For speed control 
+
+#define CORRECTION_FACTOR (0.15)
+
+typedef enum {
+  SIDEREAL_RATE = 0,
+  MOON_RATE,
+#ifdef SUN_RATE_SUPPORT
+  SUN_RATE
+#endif
+} Tracking_rate_e;
 
 // PINS definitions
 #define buzzerPin 2
@@ -51,7 +82,8 @@ const float half_arch_travel_distance = NORTH_ARCH_RADIUS*atan(TRAVEL_DISTANCE/2
 
 
 #define DISPLAY_TIMEOUT (2000) // 2 seconds
-#define DISPLAY_DELTA (1000) // 1 second
+//#define DISPLAY_DELTA (1000) // 1 second
+#define DISPLAY_DELTA (500) // 1/2 second
 #define BUZZER_DURATION (40) // 40ms
 #define BUZZER_FREQ1 (400)
 #define BUZZER_TIME1 (5*60) // 5 minutes
@@ -59,12 +91,16 @@ const float half_arch_travel_distance = NORTH_ARCH_RADIUS*atan(TRAVEL_DISTANCE/2
 #define BUZZER_TIME2 (1*60) // 1 minutes
 #define BUZZER_FREQ3 (800)
 #define BUZZER_TIME3 (15) // 15 seconds
-#define NOMINAL_RPM (6.84)
-#define RETURN_RPM (-250.0)
-#define RETURN_RPM_STEP (90.0)
+//#define RETURN_RPM (-250.0)
+#define RETURN_RPM (-320.0)
+//#define RETURN_RPM_STEP (90.0)
+#define RETURN_RPM_STEP (80.0)
 #define SETUP_TIMEOUT (8000) // 8 seconds
 #define SETUP_COUNTDOWN_DELAY (3000) // three seconds
 #define RESET_BUTTON_DELAY (2000) // two seconds
+
+#define TIMER_FAST_PERIOD (30)  // runSpeedHook to run every 0.03 miliseconds
+#define TIMER_SLOW_PERIOD (150) // runSpeedHook to run every 0.15 miliseconds
 
 typedef enum {
   AUTO_RT = 0,
@@ -84,14 +120,6 @@ typedef enum {
 //#define DEFAULT_RETURN MANUAL_RT
 
 typedef enum {
-  CONST_SPEED_ST = 0,
-  VARIABLE_SPEED_ST
-} state_e;
-
-// Default operation state
-#define DEFAULT_STATE CONST_SPEED_ST
-
-typedef enum {
   SETUP_ST = 0,
   RUNNING_ST,
   FAST_FORWARD_ST,
@@ -103,22 +131,30 @@ typedef enum {
 // Initial platform state
 #define INITIAL_PLATFORM_STATE STOP_ST
 
+typedef enum {
+  RETURN_POLICY_M = 0,
+  TRAVEL_DISTANCE_M,
+} Setup_mode_e;
 
+Setup_mode_e Setup_mode;
 Return_policy_e Return_policy;
 Platform_state_e Platform_state;
 
 // Create a display object of type TM1637TinyDisplay 4 digit display
 TM1637TinyDisplay display(CLK, DIO);
 
-//float stepsPerRevolution = 6400.0;
-float stepsPerRevolution = 800.0;
+float stepsPerRevolution = 1600.0;
+//float stepsPerRevolution = 800.0;
 
  // Set the desired rotation speed in RPM
-float Original_targetRPM;
-float nominalRPM;
+//float Original_targetRPM;
+float original_angular_velocity;
+float nominalRPM, nominalRPM_offset;
 float targetRPM;
 float returnRPM;
 int returnRPM_setup;
+
+int tracking_rate_mode;
 
 // remaining distance till arriving to stop microswitch
 float remainingDistance;
@@ -142,6 +178,7 @@ int buttonSpeedPushed;
 unsigned int DisplayMode, DisplayModeButton;
 
 int buzzerOn;
+int reset_button_pushed;
 
 int EECounter;
 
@@ -156,11 +193,21 @@ void init_vars()
 
   DisplayMode = BAR_D;
   DisplayModeButton = 0;
-
+  reset_button_pushed = 0;
+  
   // Set the desired rotation speed in RPM
-  targetRPM = NOMINAL_RPM;
-  nominalRPM = targetRPM;
-  Original_targetRPM = targetRPM;
+  push_arch_radius = PUSH_ARCH_RADIUS;
+  //half_arch_travel_distance = push_arch_radius*atan(TRAVEL_DISTANCE/2/push_arch_radius);
+  angular_velocity = SIDEREAL_ANGULAR_VELOCITY;
+//  targetRPM = SIDEREAL_RPM;
+  tracking_rate_mode = SIDEREAL_RATE;
+  nominalRPM = (angular_velocity*push_arch_radius*(float)ROD_PINS/(float)MOTOR_PINS);
+  nominalRPM_offset = (angular_velocity*RADIUS_OFFSET*(float)ROD_PINS/(float)MOTOR_PINS);
+  Serial.print("nominalRPM: ");
+  Serial.println(nominalRPM);
+  FixTargetRPMAccordingToLoacation();
+  //Original_targetRPM = targetRPM;
+  original_angular_velocity = angular_velocity;
   returnRPM = RETURN_RPM;
   returnRPM_setup = -1;
 // Calculate the desired speed based on RPM
@@ -173,7 +220,7 @@ void init_vars()
 
 	// Set the brightness to 5 (0=dimmest 7=brightest)
 	display.setBrightness(0);
-
+  Setup_mode = RETURN_POLICY_M;
   Return_policy = DEFAULT_RETURN;
 
   remainingDistance = 0;
@@ -198,6 +245,42 @@ void init_vars()
   fast_forward_ms = 0;
   fast_backward_ms = 0;
 }
+
+void ReadEEPROMVariables(void)
+{
+  Serial.println ("Read from EEPROM");
+  EEPROM.get(EP_ADDR_TRAVEL_DISTANCE, total_travel_distance);
+  Serial.print ("total_travel_distance: ");
+  Serial.println(total_travel_distance, 1);    //This may print 'ovf, nan' if the data inside the EEPROM is not a valid float.
+  if (isnan(total_travel_distance) || (total_travel_distance < TRAVEL_DISTANCE*0.9) || (total_travel_distance > TRAVEL_DISTANCE*1.1))
+  {
+    Serial.print ("total_travel_distance set to default: ");
+    total_travel_distance = TRAVEL_DISTANCE;
+    Serial.println(total_travel_distance, 1);
+  }
+  for (int n=0; n<10; n++)
+  {
+    byte b;
+    EEPROM.get(n, b);
+    Serial.print (n);
+    Serial.print (": ");
+    Serial.println(b);
+  }
+}
+
+void WriteEEPROMVariables(void)
+{
+  float read_float;
+  Serial.println ("Write to EEPROM");
+  EEPROM.get(EP_ADDR_TRAVEL_DISTANCE, read_float);
+  if (read_float != total_travel_distance)
+  {
+    Serial.print ("set total_travel_distance to: ");
+    Serial.println(total_travel_distance, 1);
+    EEPROM.put(EP_ADDR_TRAVEL_DISTANCE, total_travel_distance);
+  }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 void setup()
@@ -226,10 +309,12 @@ void setup()
 
   Platform_state = INITIAL_PLATFORM_STATE;
 
-  Timer1.initialize(150);
-  Timer1.attachInterrupt(runSpeedHook); // runSpeedHook to run every 0.15 miliseconds
-  Timer1.start();
-  
+  Timer1.initialize(TIMER_SLOW_PERIOD);
+  Timer1.attachInterrupt(runSpeedHook); 
+  //Timer1.start(); // Done when needed
+
+  ReadEEPROMVariables();
+
   init_vars();
 }
 
@@ -244,6 +329,7 @@ void Set_Error (char* Msg)
 { // Error - Stop platform now
   digitalWrite (enablePin, HIGH); // Disable motor
   Platform_state = STOP_ST;
+  Timer1.stop();
   display.showString(Msg);
   tone(buzzerPin,BUZZER_FREQ1);
   while (1);
@@ -265,7 +351,7 @@ void PrintTravelDistance (void)
 // so that the motor does not stop while writing to the display
 void runSpeedHook(void)
 {
- if ((Platform_state == RUNNING_ST) || (Platform_state == RETURN_ST) || (Platform_state == FAST_FORWARD_ST))
+// if ((Platform_state == RUNNING_ST) || (Platform_state == RETURN_ST) || (Platform_state == FAST_FORWARD_ST))
     stepper.runSpeed();
 }
 
@@ -298,95 +384,139 @@ void do_setup_loop(void)
 { // Set up return policity
   noTone(buzzerPin); // Just to be sure
 
-  if (read_speed_buttons() == LOW)
-  { // Button is pressed
-    elapsed_ms = millis();
-    if (!((buttonSpeedDownValue == LOW) && (buttonSpeedUpValue == LOW)))
-    { // Only one button is pressed (disregard when both are pressed)
-      if (buttonSpeedUpValue == LOW)
-      { // Speed up button - change policy
-        if (EECounter > 0)
+  if (digitalRead(resetPin) == LOW)
+  {
+    { // Change setup mode
+      if (reset_button_pushed == 0)
+      {
+        elapsed_ms = millis(); // Restart setupt timeout
+        reset_button_pushed = 1;
+        switch (Setup_mode)
         {
-          if (EECounter < 10)
-          {
-            EECounter += 1;
-          }
-          else
-          {
-            EECounter = 100;
-          }
-          Serial.println(EECounter);
-        }
-        switch (Return_policy)
-        {
-        case AUTO_RT:
-          Return_policy = MANUAL_RT;
-          Serial.println("Hand");
-          display.showString("HAnd");
+        case RETURN_POLICY_M:
+          Setup_mode = TRAVEL_DISTANCE_M;
+          display.showString("dist");
           break;
-        case MANUAL_RT:
-          Return_policy = MEASURE_RT;
-          Serial.println("Measure");
-          display.showString("test");
-          break;
-        case MEASURE_RT:
-          Return_policy = AUTO_RT;
-          Serial.println("Auto");
-          display.showString("Auto");
+        case TRAVEL_DISTANCE_M:
+          Setup_mode = RETURN_POLICY_M;
+          display.showString("rtrn");
           break;
         }
       }
-      else
-      { 
-        { // Speed down button - change return speed
-          returnRPM = returnRPM+(RETURN_RPM_STEP)*returnRPM_setup;
-          if ((returnRPM >= 0.0) or (returnRPM < RETURN_RPM))
-          {
-            returnRPM_setup = -returnRPM_setup;
-            returnRPM = returnRPM+(RETURN_RPM_STEP)*2*returnRPM_setup;
-          }
-          display.showNumber((int)returnRPM);
-          Serial.print("New return speed: ");
-          Serial.println(returnRPM);
-        }
-        if ((EECounter%10) == 4)
-        {
-          EECounter += 10;
-          Serial.println(EECounter);
-        }
-      }
-    }
-    else
-    { // Both are pressed
-      EECounter = 1;
     }
   }
 
-  if (EECounter == 34)
+  switch (Setup_mode)
   {
-    for (int count = 0; count < 3; count++)
-    {
-      for (int x = 0; x <= 100; x = x + 10)
-      {
-        display.showLevel(x, true);
-        delay(20);
+  case TRAVEL_DISTANCE_M:
+    if (read_speed_buttons() == LOW)
+    { // Button is pressed
+      elapsed_ms = millis(); // Restart setupt timeout
+      if (buttonSpeedUpValue == LOW)
+      { // Speed up button - increase travel distance;
+        total_travel_distance += 0.1;
       }
-      for (int x = 100; x >= 0; x = x - 10)
-      {
-        display.showLevel(x, true);
-        delay(20);
+      else
+      { // Speed down button - decrease travel distance;
+        total_travel_distance -= 0.1;
+      }
+      display.showNumber (total_travel_distance,1);
+    }
+    break;
+  case RETURN_POLICY_M:
+    if (read_speed_buttons() == LOW)
+    { // Button is pressed
+      elapsed_ms = millis(); // Restart setupt timeout
+      if (!((buttonSpeedDownValue == LOW) && (buttonSpeedUpValue == LOW)))
+      { // Only one button is pressed (disregard when both are pressed)
+        if (buttonSpeedUpValue == LOW)
+        { // Speed up button - change policy
+          if (EECounter > 0)
+          {
+            if (EECounter < 10)
+            {
+              EECounter += 1;
+            }
+            else
+            {
+              EECounter = 100;
+            }
+            Serial.println(EECounter);
+          }
+          switch (Return_policy)
+          {
+          case AUTO_RT:
+            Return_policy = MANUAL_RT;
+            Serial.println("Hand");
+            display.showString("HAnd");
+            break;
+          case MANUAL_RT:
+            Return_policy = MEASURE_RT;
+            Serial.println("Measure");
+            display.showString("test");
+            break;
+          case MEASURE_RT:
+            Return_policy = AUTO_RT;
+            Serial.println("Auto");
+            display.showString("Auto");
+            break;
+          }
+        }
+        else
+        { 
+          { // Speed down button - change return speed
+            returnRPM = returnRPM+(RETURN_RPM_STEP)*returnRPM_setup;
+            if ((returnRPM >= 0.0) or (returnRPM < RETURN_RPM))
+            {
+              returnRPM_setup = -returnRPM_setup;
+              returnRPM = returnRPM+(RETURN_RPM_STEP)*2*returnRPM_setup;
+            }
+            display.showNumber((int)returnRPM);
+            Serial.print("New return speed: ");
+            Serial.println(returnRPM);
+          }
+          if ((EECounter%10) == 4)
+          {
+            EECounter += 10;
+            Serial.println(EECounter);
+          }
+        }
+      }
+      else
+      { // Both are pressed
+        EECounter = 1;
       }
     }
-    delay(1000);
-    display.showString("Program by Nir Zonshine");
-    EECounter = 100;
+
+    if (EECounter == 34)
+    {
+      for (int count = 0; count < 3; count++)
+      {
+        for (int x = 0; x <= 100; x = x + 10)
+        {
+          display.showLevel(x, true);
+          delay(20);
+        }
+        for (int x = 100; x >= 0; x = x - 10)
+        {
+          display.showLevel(x, true);
+          delay(20);
+        }
+      }
+      delay(1000);
+      display.showString("Program by Nir Zonshine");
+      EECounter = 100;
+    }
+    break;
   }
 
   finished_ms = millis();
   // Test setup timeout
   if ((finished_ms-elapsed_ms) > SETUP_TIMEOUT)
   { // Setup timeout expired - finish setup
+    WriteEEPROMVariables();
     Platform_state = STOP_ST;
+    Timer1.stop();
     display.showString("rdy");
     Serial.println("Ready");
   }
@@ -409,13 +539,29 @@ void do_setup_loop(void)
   }
 }
 
-void FixSpeedAccordingToLoacation(void)
+void FixTargetRPMAccordingToLoacation(void)
 { // Fix the speed and target RPM according to location
-  float distanceRatio = (remainingDistance-(TRAVEL_DISTANCE/2))/NORTH_ARCH_RADIUS; // tan(alpha)
-  float alpha = atan(distanceRatio);
-  targetRPM = nominalRPM*cos(alpha);
-  //targetRPM = nominalRPM*sqrt(1-distanceRatio*distanceRatio); // nominalRPM*sqrt(1-sin(alpha)^2) = nominalRPM*cos(alpha) 
-  //targetRPM = nominalRPM*(1-distanceRatio*distanceRatio); // Using sqrt approximation for values close to 1.
+  float distanceRatio = (remainingDistance-(total_travel_distance/2));
+  //float alpha = atan(distanceRatio);
+  //targetRPM = nominalRPM*cos(alpha*ANGLE_CORRECTION_FACTOR);
+  if (distanceRatio>0)
+  {
+    distanceRatio = distanceRatio/(push_arch_radius-RADIUS_OFFSET); // tan(alpha)
+    targetRPM = (nominalRPM-nominalRPM_offset)*cos(distanceRatio*CORRECTION_FACTOR);
+  }
+  else
+  {
+    distanceRatio = distanceRatio/(push_arch_radius+RADIUS_OFFSET); // tan(alpha)
+    targetRPM = (nominalRPM+nominalRPM_offset)*cos(distanceRatio*CORRECTION_FACTOR);
+  }
+#if 0
+  Serial.print ("nominalRPM ");
+  Serial.print(nominalRPM,4);
+  Serial.print (" remainingDistance ");
+  Serial.print(remainingDistance);
+  Serial.print("   targetRPM: ");
+  Serial.println(targetRPM,4);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -434,11 +580,15 @@ void do_fast_forward_loop(void)
     {  // Microswitch stop was met - need to reset platform
       { // work like in manual mode (Return_policy == MANUAL_RT)
         digitalWrite (enablePin, HIGH); // Disable motor
-        targetRPM = Original_targetRPM; // Resume normal operation
-        nominalRPM = targetRPM;
+        angular_velocity = original_angular_velocity;
+
+        nominalRPM = (angular_velocity*push_arch_radius*(float)ROD_PINS/(float)MOTOR_PINS);
+        nominalRPM_offset = (angular_velocity*RADIUS_OFFSET*(float)ROD_PINS/(float)MOTOR_PINS);
+        FixTargetRPMAccordingToLoacation();
         targetSpeed = (returnRPM * stepsPerRevolution) / 60.0;
         stepper.setSpeed(targetSpeed);
         Platform_state = WAIT_RETURN_ST;
+        Timer1.stop();
         display.showString("push");
       }
       buttonStopCount = 0;
@@ -452,11 +602,14 @@ void do_fast_forward_loop(void)
   if (digitalRead(resetPin) == LOW)
   {
       digitalWrite (enablePin, HIGH); // Disable motor
-      targetRPM = Original_targetRPM; // Resume normal operation
-      nominalRPM = targetRPM;
+      angular_velocity = original_angular_velocity;
+      nominalRPM = (angular_velocity*push_arch_radius*(float)ROD_PINS/(float)MOTOR_PINS);
+      nominalRPM_offset = (angular_velocity*RADIUS_OFFSET*(float)ROD_PINS/(float)MOTOR_PINS);
+      FixTargetRPMAccordingToLoacation();
       targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
       stepper.setSpeed(targetSpeed);
       Platform_state = STOP_ST;
+      Timer1.stop();
       display.showString("rdy");
   }
 
@@ -477,7 +630,7 @@ void do_fast_forward_loop(void)
     if (remainingDistance > 0)
     { // Print remaining time
       remainingDistance = remainingDistance - (lastRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
-      percentage = 100.0-(remainingDistance / TRAVEL_DISTANCE) * 100.0;
+      percentage = 100.0-(remainingDistance / total_travel_distance) * 100.0;
       float remainingTime = remainingDistance / (targetRPM * (float)MOTOR_PINS/ROD_PINS)*60;
       delta_sec = remainingTime;
       if (remainingDistance<0)
@@ -490,7 +643,7 @@ void do_fast_forward_loop(void)
       }
 
       // Test for error condition - Start microswitch should be off after some time
-      if (TRAVEL_DISTANCE - remainingDistance > ERROR_TRAVEL_DISTANCE)
+      if (total_travel_distance - remainingDistance > ERROR_TRAVEL_DISTANCE)
       { // After ERROR_TRAVEL_DISTANCE start microswitch must be off
         MicroSwitchStartValue = digitalRead(MicroSwitchStartPin);
   
@@ -512,7 +665,7 @@ void do_fast_forward_loop(void)
           Set_Error("Err5");
         }
       }
-      if (travelDistance > TRAVEL_DISTANCE+END_ERROR_TRAVEL_DISTANCE)
+      if (travelDistance > total_travel_distance+END_ERROR_TRAVEL_DISTANCE)
       { // Stop micro switch should have been pushed by now - Error - Stop platform now
           Set_Error("Err6");
       }
@@ -558,7 +711,7 @@ void do_fast_forward_loop(void)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-
+int print2serial = 0;
 void do_running_loop(void)
 {
   //stepper.runSpeed(); // Activate motor
@@ -572,11 +725,13 @@ void do_running_loop(void)
     buttonStopCount++;
     if(buttonStopCount == buttonCount)
     {  // Microswitch stop was met - need to reset platform
-      remainingDistance = TRAVEL_DISTANCE;
+      remainingDistance = total_travel_distance;
       remainingDistanceDone = 0;
       if (Return_policy == AUTO_RT)
       {
         Platform_state = RETURN_ST;
+        Timer1.initialize(TIMER_FAST_PERIOD);
+        Timer1.start();
         DisplayModeButton = 0;
         targetSpeed = (returnRPM * stepsPerRevolution) / 60.0;
         timeout_ms = millis();
@@ -589,6 +744,7 @@ void do_running_loop(void)
         digitalWrite (enablePin, HIGH); // Disable motor
         Serial.println("Motor disabled");
         Platform_state = WAIT_RETURN_ST;
+        Timer1.stop();
         if (Return_policy == MEASURE_RT)
         {
           PrintTravelDistance();
@@ -611,6 +767,7 @@ void do_running_loop(void)
       digitalWrite (enablePin, HIGH); // Disable motor
       Serial.println("Motor disabled");
       Platform_state = STOP_ST;
+      Timer1.stop();
       display.showString("rdy");
   }
   else
@@ -625,29 +782,40 @@ void do_running_loop(void)
         { // Increase speed
           if (fast_forward_ms == 0)
           {
-            Original_targetRPM = nominalRPM;
+            original_angular_velocity = angular_velocity;
             fast_forward_ms = millis();
           }
           fast_backward_ms = 0;
-          nominalRPM += 0.02;
-          targetRPM += 0.02;
+          angular_velocity += ANGULAR_VELOCITY_STEP;
         }
         else
         { // Decrease speed
           if (fast_backward_ms == 0)
           {
-            Original_targetRPM = nominalRPM;
+            original_angular_velocity = angular_velocity;
             fast_backward_ms = millis();
           }
+          angular_velocity -= ANGULAR_VELOCITY_STEP;
           fast_forward_ms = 0;
-          nominalRPM -= 0.02;
-          targetRPM -= 0.02;
         }
+        //half_arch_travel_distance = push_arch_radius*atan(TRAVEL_DISTANCE/2/push_arch_radius);
+        nominalRPM = (angular_velocity*push_arch_radius*(float)ROD_PINS/(float)MOTOR_PINS);
+        nominalRPM_offset = (angular_velocity*RADIUS_OFFSET*(float)ROD_PINS/(float)MOTOR_PINS);
+        FixTargetRPMAccordingToLoacation();
+
         timeout_ms = millis(); // This will make the speed appear on the screen for 3 seconds
-        Serial.print("New speed: ");
-        Serial.println(nominalRPM);
+        Serial.print("New angular velocity: ");
+        Serial.println(angular_velocity*1000000.0);
+        print2serial = 1;
+        if (tracking_rate_mode == SIDEREAL_RATE)
+        {
+          display.showNumber((angular_velocity-SIDEREAL_ANGULAR_VELOCITY)*1000000.0, 0);
+        }
+        else
+        { // MOON_RATE
+          display.showNumber((angular_velocity-MOON_ANGULAR_VELOCITY)*1000000.0, 0);
+        }
         // Calculate the desired speed based on RPM
-        display.showNumber(nominalRPM, 2);
         targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
 
         // Set the desired speed
@@ -659,27 +827,35 @@ void do_running_loop(void)
         {
           // Fast forwarding requested
           Platform_state = FAST_FORWARD_ST;
+          Timer1.initialize(TIMER_FAST_PERIOD);
+          Timer1.start();
           DisplayModeButton = 0;
           targetRPM = -returnRPM;
           targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
           timeout_ms = millis();
+          start_ms = timeout_ms;
           stepper.setSpeed(targetSpeed);
           display.showString("ff");
           tone(buzzerPin,BUZZER_FREQ1,BUZZER_DURATION);
         }
         if ((fast_backward_ms > 0) && (millis()-fast_backward_ms >= RESET_BUTTON_DELAY))
         {
-          // Fast backard requested
+          // Fast backward requested
           if (remainingDistance > 0)
           {
-            remainingDistance = TRAVEL_DISTANCE - remainingDistance;
+            remainingDistance = total_travel_distance - remainingDistance;
           }
           Platform_state = RETURN_ST;
+          Timer1.initialize(TIMER_FAST_PERIOD);
+          Timer1.start();
           DisplayModeButton = 0;
           targetRPM = returnRPM;
-          nominalRPM = Original_targetRPM;
+          angular_velocity = original_angular_velocity;
+          nominalRPM = (angular_velocity*push_arch_radius*(float)ROD_PINS/(float)MOTOR_PINS);
+          nominalRPM_offset = (angular_velocity*RADIUS_OFFSET*(float)ROD_PINS/(float)MOTOR_PINS);
           targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
           timeout_ms = millis();
+          start_ms = timeout_ms;
           stepper.setSpeed(targetSpeed);
           display.showString("rtrn");        
           Serial.println("Motor reversed");
@@ -717,24 +893,34 @@ void do_running_loop(void)
       else
       { // Fix targetRPM according to location
 //        Serial.print ("remainingDistance ");
-//        Serial.println(remainingDistance);
-        float distanceRatio = (remainingDistance-(TRAVEL_DISTANCE/2))/NORTH_ARCH_RADIUS; // tan(alpha)
+  //      Serial.println(remainingDistance);
+    //    float distanceRatio = (remainingDistance-(total_travel_distance/2))/push_arch_radius; // tan(alpha)
 //        Serial.print ("distanceRatio ");
 //        Serial.println(distanceRatio);
-        float alpha = atan(distanceRatio);
+        //float alpha = atan(distanceRatio);
 //        Serial.print ("alpha ")
 //        Serial.println(alpha);
-        float ArchRemainingDistance = NORTH_ARCH_RADIUS*alpha + half_arch_travel_distance;
+        //float ArchRemainingDistance = push_arch_radius*alpha + half_arch_travel_distance;
 //        Serial.print ("ArchRemainingDistance ");
 //        Serial.println(ArchRemainingDistance);
 
-        float remainingTime = ArchRemainingDistance / (nominalRPM * (float)MOTOR_PINS/ROD_PINS)*60;
+        //float remainingTime = ArchRemainingDistance / (nominalRPM * (float)MOTOR_PINS/ROD_PINS)*60.0;
+        float remainingTime = remainingDistance / (nominalRPM * (float)MOTOR_PINS/ROD_PINS)*60.0;
 //        Serial.print ("remainingTime ");
 //        Serial.println(remainingTime);
         //float remainingTime = remainingDistance / (nominalRPM * (float)MOTOR_PINS/ROD_PINS)*60*SIN_APPROXIMATION_FACTOR;
         delta_sec = remainingTime;
-        targetRPM = nominalRPM*cos(alpha);
-        //FixSpeedAccordingToLoacation();
+      //  targetRPM = nominalRPM*cos(distanceRatio*CORRECTION_FACTOR);
+        //targetRPM = nominalRPM*cos(alpha*ANGLE_CORRECTION_FACTOR);
+        FixTargetRPMAccordingToLoacation();
+        if (print2serial == 1)
+        {
+          print2serial = 0;
+          Serial.print ("remainingDistance ");
+          Serial.print(remainingDistance);
+          Serial.print("   targetRPM: ");
+          Serial.println(targetRPM,4);
+        }
         targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
         stepper.setSpeed(targetSpeed);
 
@@ -758,7 +944,7 @@ void do_running_loop(void)
 
 
       // Test for error condition - Start microswitch should be off after some time
-      if (TRAVEL_DISTANCE - remainingDistance > ERROR_TRAVEL_DISTANCE)
+      if (total_travel_distance - remainingDistance > ERROR_TRAVEL_DISTANCE)
       { // After ERROR_TRAVEL_DISTANCE start microswitch must be off
         MicroSwitchStartValue = digitalRead(MicroSwitchStartPin);
   
@@ -780,7 +966,7 @@ void do_running_loop(void)
           Set_Error("Err2");
         }
       }
-      if (travelDistance > TRAVEL_DISTANCE+ERROR_TRAVEL_DISTANCE)
+      if (travelDistance > total_travel_distance+ERROR_TRAVEL_DISTANCE)
       { // Stop micro switch should have been pushed by now - Error - Stop platform now
           Set_Error("Err3");
       }
@@ -834,15 +1020,18 @@ void do_return_loop(void)
         }
         else
         {
-          remainingDistance = TRAVEL_DISTANCE;
-          FixSpeedAccordingToLoacation(); // Update targetRPM
+          remainingDistance = total_travel_distance;
+          FixTargetRPMAccordingToLoacation(); // Update targetRPM
         }
         remainingDistanceDone = 0;
         targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
         stepper.setSpeed(targetSpeed);
         display.showString("Strt");
         timeout_ms = millis();
+        start_ms = timeout_ms;
         Platform_state = RUNNING_ST;
+        Timer1.initialize(TIMER_SLOW_PERIOD);
+        Timer1.start();
         buzzerOn = 0;
         Serial.println("Motor restarted");
       }
@@ -855,8 +1044,8 @@ void do_return_loop(void)
       digitalWrite (enablePin, HIGH); // Disable motor
       if (remainingDistance > 0)
       {
-        remainingDistance = TRAVEL_DISTANCE - remainingDistance;
-        FixSpeedAccordingToLoacation(); // Update targetRPM
+        remainingDistance = total_travel_distance - remainingDistance;
+        FixTargetRPMAccordingToLoacation(); // Update targetRPM
       }
       else
       {
@@ -865,6 +1054,7 @@ void do_return_loop(void)
       targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
       stepper.setSpeed(targetSpeed);
       Platform_state = STOP_ST;
+      Timer1.stop();
       display.showString("rdy");
   }
   
@@ -887,7 +1077,7 @@ void do_return_loop(void)
     if (remainingDistance > 0)
     { // Print remaining time
       remainingDistance = remainingDistance - (-returnRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
-      percentage = (remainingDistance / TRAVEL_DISTANCE) * 100.0;
+      percentage = (remainingDistance / total_travel_distance) * 100.0;
       float remainingTime = remainingDistance / (-returnRPM * (float)MOTOR_PINS/ROD_PINS)*60;
       delta_sec = remainingTime;
       if (remainingDistance<0)
@@ -899,7 +1089,7 @@ void do_return_loop(void)
         start_ms = finished_ms;
       }
       // Test for error condition - Stop microswitch should be off after some time
-      if (TRAVEL_DISTANCE - remainingDistance > ERROR_TRAVEL_DISTANCE)
+      if (total_travel_distance - remainingDistance > ERROR_TRAVEL_DISTANCE)
       { // After ERROR_TRAVEL_DISTANCE stop microswitch must be off
         MicroSwitchStopValue = digitalRead(MicroSwitchStopPin);
   
@@ -921,7 +1111,7 @@ void do_return_loop(void)
           Set_Error("Er11");
         }
       }
-      if (travelDistance > TRAVEL_DISTANCE+ERROR_TRAVEL_DISTANCE)
+      if (travelDistance > total_travel_distance+ERROR_TRAVEL_DISTANCE)
       { // Start micro switch should have been pushed by now - Error - Stop platform now
           Set_Error("Er12");
       }
@@ -972,16 +1162,60 @@ void do_stop_loop(void)
   noTone(buzzerPin); // Just to be sure
 
   if (read_speed_buttons() == LOW)
-  { // Button is pressed - enable motor
+  { // Button is pressed
     digitalWrite (enablePin, LOW); // Enable motor
     tone(buzzerPin,BUZZER_FREQ1,BUZZER_DURATION);
     Platform_state = RUNNING_ST;
+    Timer1.initialize(TIMER_SLOW_PERIOD);
+    Timer1.start();
+
     buzzerOn = 0;
     Serial.println("Motor enabled");
     display.showString("Strt");
     timeout_ms = millis();
     elapsed_ms = timeout_ms;
     start_ms = timeout_ms;
+  }
+
+  if (digitalRead(resetPin) == LOW)
+  {
+    if (reset_ms == 0)
+    {
+      reset_ms = millis();
+    }
+    else if (millis()-reset_ms >= RESET_BUTTON_DELAY)
+    { // Change nominal tracking mode
+      if (reset_button_pushed == 0)
+      {
+        reset_button_pushed = 1;
+        if (tracking_rate_mode == SIDEREAL_RATE)
+        { // Switch to Moon mode
+          angular_velocity = MOON_ANGULAR_VELOCITY;
+          tracking_rate_mode = MOON_RATE;
+          Serial.println("Moon");
+          display.showString("Luna");
+        }
+        else if (tracking_rate_mode == MOON_RATE)
+#ifdef SUN_RATE_SUPPORT      
+        { // Switch to Sun mode
+          angular_velocity = SUN_ANGULAR_VELOCITY;
+          tracking_rate_mode = SUN_RATE;
+          Serial.println("Sun");
+          display.showString("Sun");
+        }
+        else // (tracking_rate_mode == SUN_RATE)
+#endif        
+        { // Switch to Sidereal mode
+          angular_velocity = SIDEREAL_ANGULAR_VELOCITY;
+          tracking_rate_mode = SIDEREAL_RATE;
+          Serial.println("Sidereal");
+          display.showString("Side");
+        }
+        nominalRPM = (angular_velocity*push_arch_radius*(float)ROD_PINS/(float)MOTOR_PINS);
+        nominalRPM_offset = (angular_velocity*RADIUS_OFFSET*(float)ROD_PINS/(float)MOTOR_PINS);
+        FixTargetRPMAccordingToLoacation();
+      }
+    }
   }
 }
 
@@ -995,10 +1229,12 @@ void do_wait_return_loop(void)
   { // Button is pressed - enable motor
     digitalWrite (enablePin, LOW); // Enable motor
     tone(buzzerPin,BUZZER_FREQ1,BUZZER_DURATION);
-    remainingDistance = TRAVEL_DISTANCE;
-    FixSpeedAccordingToLoacation();
+    remainingDistance = total_travel_distance;
+    FixTargetRPMAccordingToLoacation();
     remainingDistanceDone = 0;
     Platform_state = RETURN_ST;
+    Timer1.initialize(TIMER_FAST_PERIOD);
+    Timer1.start();
     DisplayModeButton = 0;
     targetSpeed = (returnRPM * stepsPerRevolution) / 60.0;
     if (Return_policy == MEASURE_RT)
@@ -1011,6 +1247,7 @@ void do_wait_return_loop(void)
     }
     timeout_ms = millis();
     elapsed_ms = timeout_ms;
+    start_ms = timeout_ms;
     stepper.setSpeed(targetSpeed);
     Serial.println("Motor reversed");
   }
@@ -1042,24 +1279,18 @@ void loop()
       break;
   }
   
-  // Change speed with serial input
+#if 0  
+  // Change remaining distance with serial input
   if (Serial.available())
   {
     // Read the serial input.
-    float newestSpeed = Serial.parseFloat();
-    if (newestSpeed != 0)
+    float new_remainingDistance = Serial.parseFloat();
+    if (new_remainingDistance != 0)
     {
-      targetRPM = newestSpeed;
-      Serial.print("New speed: ");
-      Serial.println(targetRPM);
-      // Calculate the desired speed based on RPM
-      display.showNumber(targetRPM, 1);
-      targetSpeed = (targetRPM * stepsPerRevolution) / 60.0;
-
-      // Set the desired speed
-      stepper.setSpeed(targetSpeed);
+      remainingDistance = new_remainingDistance;
     }
   }
+#endif
 
   if (digitalRead(resetPin) == LOW)
   {
@@ -1067,15 +1298,17 @@ void loop()
     {
       reset_ms = millis();
     }
-    else if (millis()-reset_ms >= RESET_BUTTON_DELAY)
-    {
-      // Reset requested
+    else if (millis()-reset_ms >= 2*RESET_BUTTON_DELAY)
+    { // Reset requested
       Platform_state = SETUP_ST;
+      Timer1.stop();
       init_vars();
+      reset_button_pushed = 1;
     }
   }
   else
   {
+    reset_button_pushed = 0;
     reset_ms = 0;
   }
 }
