@@ -3,7 +3,7 @@
 #include <TM1637TinyDisplay.h>
 #include <TimerOne.h>
 #include <EEPROM.h>
-// Version 10 - Fix tangent error
+// Version 12 - Add fast movement fix ratios
 
 void(* resetFunc) (void) = 0;//declare reset function at address 0
 
@@ -12,12 +12,14 @@ void(* resetFunc) (void) = 0;//declare reset function at address 0
 #define EP_ADDR_TRAVEL_DISTANCE 0
 
 // The distance between the start and stop position of the platform in mm
-#define TRAVEL_DISTANCE 169.50 // Nir
+#define TRAVEL_DISTANCE 170.5 // Nir
 //#define TRAVEL_DISTANCE 176.0 // Guy
 //#define TRAVEL_DISTANCE 155.65 // Renewed
 float total_travel_distance;
 #define ERROR_TRAVEL_DISTANCE 2.7
 #define END_ERROR_TRAVEL_DISTANCE 3.5
+
+#define FAST_MOVEMENT_FIX_RATIO 0.97
 
 // Number of pins on the motor screw
 #define MOTOR_PINS 12
@@ -91,9 +93,7 @@ typedef enum {
 #define BUZZER_TIME2 (1*60) // 1 minutes
 #define BUZZER_FREQ3 (800)
 #define BUZZER_TIME3 (15) // 15 seconds
-//#define RETURN_RPM (-250.0)
 #define RETURN_RPM (-320.0)
-//#define RETURN_RPM_STEP (90.0)
 #define RETURN_RPM_STEP (80.0)
 #define SETUP_TIMEOUT (8000) // 8 seconds
 #define SETUP_COUNTDOWN_DELAY (3000) // three seconds
@@ -337,13 +337,11 @@ void Set_Error (char* Msg)
 
 ////////////////////////////////////////////////////////////////////////////////
 void PrintTravelDistance (void)
-{ // Print travel distance with 2 digits after the decimal point
-  float localTravelDistance = travelDistance;
-  if (localTravelDistance > 100.0)
-  {
-    localTravelDistance = localTravelDistance - 100;
-  }
-  display.showNumber(localTravelDistance,2);
+{ // Print travel distance with 1 digit after the decimal point
+  display.showNumber(total_travel_distance - remainingDistance + travelDistance,1);
+  Serial.print(travelDistance);
+  Serial.print(" , ");
+  Serial.println(remainingDistance);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -567,9 +565,6 @@ void FixTargetRPMAccordingToLoacation(void)
 ////////////////////////////////////////////////////////////////////////////////
 void do_fast_forward_loop(void)
 {
-  //stepper.runSpeed(); // Activate motor
-  float lastRPM = targetRPM;
-
   // First - test for stop microswitch
   MicroSwitchStopValue = digitalRead(MicroSwitchStopPin);
   
@@ -627,11 +622,12 @@ void do_fast_forward_loop(void)
   { // One second has passed. Update display
     float percentage = 0;
     long delta_sec = (finished_ms-start_ms)/1000;
+    float tmpRPM = FAST_MOVEMENT_FIX_RATIO*targetRPM;
     if (remainingDistance > 0)
     { // Print remaining time
-      remainingDistance = remainingDistance - (lastRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
+      remainingDistance = remainingDistance - (tmpRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
       percentage = 100.0-(remainingDistance / total_travel_distance) * 100.0;
-      float remainingTime = remainingDistance / (targetRPM * (float)MOTOR_PINS/ROD_PINS)*60;
+      float remainingTime = remainingDistance / (tmpRPM * (float)MOTOR_PINS/ROD_PINS)*60;
       delta_sec = remainingTime;
       if (remainingDistance<0)
       {
@@ -655,7 +651,7 @@ void do_fast_forward_loop(void)
     }
     else
     {  // Calculate travel distance
-      travelDistance = travelDistance + (lastRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
+      travelDistance = travelDistance + (tmpRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
       if (travelDistance > ERROR_TRAVEL_DISTANCE)
       { // After ERROR_TRAVEL_DISTANCE start microswitch must be off
         MicroSwitchStartValue = digitalRead(MicroSwitchStartPin);
@@ -725,8 +721,6 @@ void do_running_loop(void)
     buttonStopCount++;
     if(buttonStopCount == buttonCount)
     {  // Microswitch stop was met - need to reset platform
-      remainingDistance = total_travel_distance;
-      remainingDistanceDone = 0;
       if (Return_policy == AUTO_RT)
       {
         Platform_state = RETURN_ST;
@@ -754,6 +748,8 @@ void do_running_loop(void)
           display.showString("push");
         }
       }
+      remainingDistance = total_travel_distance;
+      remainingDistanceDone = 0;
       buttonStopCount = 0;
     }
   }
@@ -1015,10 +1011,10 @@ void do_return_loop(void)
       {
         if (Return_policy == MEASURE_RT)
         {
-          remainingDistance = 0;
+//          remainingDistance = 0;
           travelDistance = 0;
         }
-        else
+//        else
         {
           remainingDistance = total_travel_distance;
           FixTargetRPMAccordingToLoacation(); // Update targetRPM
@@ -1074,11 +1070,12 @@ void do_return_loop(void)
   { // One second has passed. Update display
     float percentage = 0;
     long delta_sec = (finished_ms-start_ms)/1000;
+    float tmpRPM = returnRPM*FAST_MOVEMENT_FIX_RATIO;
     if (remainingDistance > 0)
     { // Print remaining time
-      remainingDistance = remainingDistance - (-returnRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
+      remainingDistance = remainingDistance - (-tmpRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
       percentage = (remainingDistance / total_travel_distance) * 100.0;
-      float remainingTime = remainingDistance / (-returnRPM * (float)MOTOR_PINS/ROD_PINS)*60;
+      float remainingTime = remainingDistance / (-tmpRPM * (float)MOTOR_PINS/ROD_PINS)*60;
       delta_sec = remainingTime;
       if (remainingDistance<0)
       {
@@ -1094,14 +1091,14 @@ void do_return_loop(void)
         MicroSwitchStopValue = digitalRead(MicroSwitchStopPin);
   
         if (MicroSwitchStopValue == LOW)
-        { // Start Microswitch pushed - Error - Stop platform now
+        { // Stop microswitch should be off after some time - Error - Stop platform now
           Set_Error("Err9");
         }
       }
     }
     else
     {  // Calculate travel distance
-      travelDistance = travelDistance + (-returnRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
+      travelDistance = travelDistance + (-tmpRPM * (float)MOTOR_PINS/ROD_PINS * (float)(finished_ms - elapsed_ms)/60000);
       if (travelDistance > ERROR_TRAVEL_DISTANCE)
       { // After ERROR_TRAVEL_DISTANCE Stop microswitch must be off
         MicroSwitchStopValue = digitalRead(MicroSwitchStopPin);
@@ -1111,11 +1108,11 @@ void do_return_loop(void)
           Set_Error("Er11");
         }
       }
-      if (travelDistance > total_travel_distance+ERROR_TRAVEL_DISTANCE)
+      if (travelDistance > total_travel_distance+END_ERROR_TRAVEL_DISTANCE)
       { // Start micro switch should have been pushed by now - Error - Stop platform now
           Set_Error("Er12");
       }
-      if ((remainingDistanceDone == 1) && (travelDistance > ERROR_TRAVEL_DISTANCE))
+      if ((remainingDistanceDone == 1) && (travelDistance > END_ERROR_TRAVEL_DISTANCE))
       {
         // Start micro switch should have been pushed by now - Error - Stop platform now
           Set_Error("Err0");
@@ -1229,6 +1226,10 @@ void do_wait_return_loop(void)
   { // Button is pressed - enable motor
     digitalWrite (enablePin, LOW); // Enable motor
     tone(buzzerPin,BUZZER_FREQ1,BUZZER_DURATION);
+    if (Return_policy != MEASURE_RT)
+    {
+      display.showString("rtrn");        
+    }
     remainingDistance = total_travel_distance;
     FixTargetRPMAccordingToLoacation();
     remainingDistanceDone = 0;
@@ -1237,14 +1238,6 @@ void do_wait_return_loop(void)
     Timer1.start();
     DisplayModeButton = 0;
     targetSpeed = (returnRPM * stepsPerRevolution) / 60.0;
-    if (Return_policy == MEASURE_RT)
-    {
-      PrintTravelDistance();
-    }
-    else
-    {
-      display.showString("rtrn");        
-    }
     timeout_ms = millis();
     elapsed_ms = timeout_ms;
     start_ms = timeout_ms;
