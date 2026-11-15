@@ -30,6 +30,8 @@ void DisplayUI::reset(PlatformState currentState) {
 
   if (currentState == SETUP_ST) {
     display_.showString("Stup");
+  } else if (currentState == ERROR_ST) {
+    display_.showString("Err ");
   } else {
     display_.showString("rdy");
   }
@@ -129,3 +131,32 @@ void DisplayUI::updateCountdownBuzzer(float remainingTimeSec) {
   }
 }
 
+void DisplayUI::playErrorAlertPattern() {
+  for (int i = 0; i < 3; i++) {
+    tone(PIN_BUZZER, ERROR_BUZZER_FREQ_HZ, ERROR_BEEP_DURATION_MS);
+    delay(150);
+  }
+}
+
+void DisplayUI::playBootFaultAlarm() {
+  tone(PIN_BUZZER, 400, 100);
+  delay(120);
+  tone(PIN_BUZZER, 600, 100);
+  delay(120);
+  tone(PIN_BUZZER, 800, 200);
+  delay(220);
+}
+
+void DisplayUI::playReminderChirp() {
+  tone(PIN_BUZZER, ERROR_BUZZER_FREQ_HZ, 40);
+}
+
+void DisplayUI::flashBootFault(const char* mnemonic) {
+  playBootFaultAlarm();
+  for (int i = 0; i < 3; i++) {
+    showStatus("Err ");
+    delay(500);
+    showStatus(mnemonic);
+    delay(500);
+  }
+}

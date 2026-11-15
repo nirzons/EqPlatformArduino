@@ -14,7 +14,11 @@ public:
   // Executes one iteration of the active platform state and global Reset hold check.
   void update();
 
+  // Transitions immediately to ERROR_ST upon safety fault
+  void enterErrorState(FaultCode code);
+
   PlatformState getState() const { return state_; }
+  FaultCode     getActiveFault() const { return activeFault_; }
 
 private:
   // Full variable reset (used at power-up and when entering Setup via 4s Reset hold).
@@ -36,13 +40,16 @@ private:
   void updateFastForwardState();
   void updateReturnState();
   void updateWaitReturnState();
+  void updateErrorState();
 
   // Shared distance, safety, and progress-display handler for Fast-Forward and Return
   void updateFastMotionProgress(
       float effectivePositiveRpm,
       bool invertPercentage,
       bool isDepartureSwitchActive,
-      const MotionFaultCodes& faultCodes);
+      FaultCode departureFault,
+      FaultCode overrunFault,
+      float overrunMarginMm);
 
   PlatformState state_;
   SetupMode     setupMode_;
@@ -57,6 +64,13 @@ private:
   bool resetButtonHandled_;
   int  easterEggCounter_;
 
+  // Error state variables
+  FaultCode     activeFault_;
+  unsigned long errorBlinkMs_;
+  unsigned long errorChirpMs_;
+  bool          errorBlinkToggle_;
+  bool          errorChirpMuted_;
+
   unsigned long startMs_;
   unsigned long elapsedMs_;
   unsigned long timeoutMs_;
@@ -69,4 +83,3 @@ private:
 extern StateMachine stateMachine;
 
 #endif // STATE_MACHINE_H
-

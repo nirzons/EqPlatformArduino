@@ -36,6 +36,12 @@ public:
   void playContinuousErrorTone();
   void updateCountdownBuzzer(float remainingTimeSec);
 
+  // Part B error alert feedback
+  void playErrorAlertPattern();         // 3 distinct alarm beeps
+  void playBootFaultAlarm();            // Multi-tone boot warning for unacknowledged faults
+  void playReminderChirp();             // Brief 30s reminder chirp
+  void flashBootFault(const char* mnemonic); // Flash Err / Mnemonic with audible alarm on boot
+
 private:
   void cycleDisplayMode();
 
@@ -48,4 +54,3 @@ private:
 extern DisplayUI displayUI;
 
 #endif // DISPLAY_UI_H
-

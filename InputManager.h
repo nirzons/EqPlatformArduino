@@ -29,6 +29,14 @@ public:
   bool checkStartSwitchTriggered();
   bool checkStopSwitchTriggered();
 
+  // Debounced safety checks:
+  // Returns true only if both switches read active for SWITCH_DEBOUNCE_SAMPLES consecutive reads.
+  bool checkBothSwitchesActiveDebounced();
+  // Returns true if Start switch is debounced active (for direction checks during forward motion).
+  bool isStartSwitchDebouncedActive();
+  // Returns true if Stop switch is debounced active (for direction checks during return motion).
+  bool isStopSwitchDebouncedActive();
+
   // Raw instantaneous microswitch reads (used by safety checks after travel threshold).
   bool isStartSwitchRawActive() const;
   bool isStopSwitchRawActive() const;

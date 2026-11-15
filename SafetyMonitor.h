@@ -3,36 +3,38 @@
 
 #include "Config.h"
 
-struct MotionFaultCodes {
-  const char* stuckOnHomedDeparture;   // Departure limit switch still active when remainingDistance > 0
-  const char* stuckOnUnhomedDeparture; // Departure limit switch still active when remainingDistance == 0
-  const char* fullTravelOverrun;       // Exceeded totalTravelDistance + overrunMarginMm
-  const char* homedEndOverrun;         // Exceeded overrunMarginMm after remainingDistance reached 0
-  float       overrunMarginMm;         // ERROR_TRAVEL_DISTANCE_MM or END_ERROR_TRAVEL_DISTANCE_MM
-};
-
 class SafetyMonitor {
 public:
+  // Hardware sanity check: checks if both switches are reading LOW simultaneously
+  // (debounced over SWITCH_DEBOUNCE_SAMPLES to prevent noise spikes from triggering).
+  static bool checkSwitchShort();
+
+  // Direction sanity checks (debounced):
+  // In forward travel (Tracking / FF), once departed from Start switch (> 5.4 mm), Start switch shouldn't trigger.
+  static bool checkUnexpectedStartSwitch(float distanceFromStartMm);
+  // In return travel, once departed from Stop switch (> 5.4 mm), Stop switch shouldn't trigger.
+  static bool checkUnexpectedStopSwitch(float distanceFromStopMm);
+
   // Validates that the departure limit switch cleared after moving ERROR_TRAVEL_DISTANCE_MM
   // during a homed move (when remainingDistanceMm started > 0).
-  static void checkHomedDeparture(
+  // Returns true if a fault was triggered.
+  static bool checkHomedDeparture(
       float totalTravelMm,
       float remainingMm,
       bool isDepartureSwitchActive,
-      const MotionFaultCodes& codes);
+      FaultCode departureFault);
 
   // Validates departure switch release and end-of-travel overrun limits when moving
   // without remaining distance (unhomed start or after remainingDistance reached 0).
-  static void checkUnhomedOrOverrun(
+  // Returns true if a fault was triggered.
+  static bool checkUnhomedOrOverrun(
       float totalTravelMm,
       float traveledMm,
       bool remainingDistanceDone,
       bool isDepartureSwitchActive,
-      const MotionFaultCodes& codes);
-
-  // Immediately disables motor & Timer1, displays fault message, sounds alarm, and halts.
-  static void triggerFatalError(const char* errorCode);
+      FaultCode departureFault,
+      FaultCode overrunFault,
+      float overrunMarginMm);
 };
 
 #endif // SAFETY_MONITOR_H
-

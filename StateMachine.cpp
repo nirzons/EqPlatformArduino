@@ -6,34 +6,6 @@
 
 StateMachine stateMachine;
 
-namespace {
-
-const MotionFaultCodes RUNNING_FAULT_CODES = {
-    "Err1", // Start switch stuck when homed
-    "Err2", // Start switch stuck when unhomed
-    "Err3", // Full travel overrun without Stop switch
-    "Err8", // End-of-remaining-distance overrun without Stop switch
-    ERROR_TRAVEL_DISTANCE_MM
-};
-
-const MotionFaultCodes FAST_FORWARD_FAULT_CODES = {
-    "Err4", // Start switch stuck when homed
-    "Err5", // Start switch stuck when unhomed
-    "Err6", // Full travel overrun without Stop switch
-    "Err7", // End-of-remaining-distance overrun without Stop switch
-    END_ERROR_TRAVEL_DISTANCE_MM
-};
-
-const MotionFaultCodes RETURN_FAULT_CODES = {
-    "Err9", // Stop switch stuck when homed
-    "Er11", // Stop switch stuck when unhomed
-    "Er12", // Full return overrun without Start switch
-    "Err0", // End-of-remaining-distance overrun without Start switch
-    END_ERROR_TRAVEL_DISTANCE_MM
-};
-
-} // namespace
-
 StateMachine::StateMachine()
     : state_(INITIAL_PLATFORM_STATE),
       setupMode_(RETURN_POLICY_M),
@@ -45,6 +17,11 @@ StateMachine::StateMachine()
       printTrackingDebug_(false),
       resetButtonHandled_(false),
       easterEggCounter_(0),
+      activeFault_(FAULT_NONE),
+      errorBlinkMs_(0),
+      errorChirpMs_(0),
+      errorBlinkToggle_(false),
+      errorChirpMuted_(false),
       startMs_(0),
       elapsedMs_(0),
       timeoutMs_(0),
@@ -57,6 +34,29 @@ void StateMachine::begin() {
   easterEggCounter_      = 0;
   state_                 = INITIAL_PLATFORM_STATE;
   totalTravelDistanceMm_ = SettingsStorage::loadTravelDistance();
+
+  // Diagnostics check on boot: print fault history
+  FaultRecord lastFault = SettingsStorage::loadFaultRecord();
+  if (lastFault.magic != 0 && lastFault.code != FAULT_NONE) {
+    Serial.print(F("Last Fault History: "));
+    Serial.print(SettingsStorage::getFaultMnemonic(static_cast<FaultCode>(lastFault.code)));
+    Serial.print(F(" ("));
+    Serial.print(SettingsStorage::getFaultDescription(static_cast<FaultCode>(lastFault.code)));
+    Serial.print(F(") at "));
+    Serial.print(lastFault.travelMm, 1);
+    Serial.print(F(" mm, acknowledged="));
+    Serial.println(lastFault.acknowledged);
+
+    // If fault was unacknowledged (abnormal shutdown / crash / power cut during error):
+    if (lastFault.acknowledged == 0) {
+      Serial.println(F("WARNING: Unacknowledged fault detected from previous session!"));
+      displayUI.flashBootFault(SettingsStorage::getFaultMnemonic(static_cast<FaultCode>(lastFault.code)));
+      SettingsStorage::acknowledgeFaultRecord();
+    }
+  } else {
+    Serial.println(F("Fault History: None"));
+  }
+
   resetVariables();
 }
 
@@ -68,6 +68,8 @@ void StateMachine::resetVariables() {
   remainingDistanceDone_ = false;
   printTrackingDebug_    = false;
   resetButtonHandled_    = false;
+  activeFault_           = FAULT_NONE;
+  errorChirpMuted_       = false;
 
   inputManager.reset();
   platformDrive.resetParameters(remainingDistanceMm_, totalTravelDistanceMm_);
@@ -103,9 +105,12 @@ void StateMachine::update() {
     case STOP_ST:
       updateStopState();
       break;
+    case ERROR_ST:
+      updateErrorState();
+      return; // Do not check normal setup hold in error state
   }
 
-  // Global 4-second Reset button hold enters Setup from any state
+  // Global 4-second Reset button hold enters Setup from normal states
   if (inputManager.isResetButtonRawActive()) {
     const unsigned long now = millis();
     if (resetHoldStartMs_ == 0) {
@@ -143,6 +148,13 @@ void StateMachine::enterRunningFromStop() {
   platformDrive.enableMotor();
   displayUI.playShortBeep();
   state_ = RUNNING_ST;
+
+  if (remainingDistanceMm_ > 0.0f) {
+    platformDrive.fixTargetRpmForLocation(remainingDistanceMm_, totalTravelDistanceMm_);
+  } else {
+    platformDrive.setTargetRpm(platformDrive.getNominalRpm());
+  }
+  platformDrive.applyTargetRpmToStepper();
   platformDrive.startTrackingTimer();
 
   displayUI.resetCountdownBuzzer();
@@ -233,6 +245,42 @@ void StateMachine::enterWaitReturnState(bool restoreVelocitySnapshot) {
   Serial.println(F("Motor disabled"));
 }
 
+void StateMachine::enterErrorState(FaultCode code) {
+  // 1. Immediately kill motion
+  platformDrive.disableMotor();
+  platformDrive.stopTimer();
+
+  // 2. Set error state & diagnostics
+  const PlatformState previousState = state_;
+  state_            = ERROR_ST;
+  activeFault_      = code;
+  errorBlinkMs_     = millis();
+  errorChirpMs_     = millis();
+  errorBlinkToggle_ = true;
+  errorChirpMuted_  = false;
+  resetHoldStartMs_ = 0;
+
+  float currentPosMm = (remainingDistanceMm_ > 0.0f) ? (totalTravelDistanceMm_ - remainingDistanceMm_) : travelDistanceMm_;
+
+  // Log to Serial with legacy equivalent
+  Serial.print(F("FAULT DETECTED: ["));
+  Serial.print(SettingsStorage::getFaultMnemonic(code));
+  Serial.print(F("] "));
+  Serial.print(SettingsStorage::getFaultDescription(code));
+  Serial.print(F(" (legacy: "));
+  Serial.print(SettingsStorage::getLegacyErrorCode(code, previousState));
+  Serial.print(F(") at "));
+  Serial.print(currentPosMm, 1);
+  Serial.println(F(" mm"));
+
+  // 3. Save to EEPROM fault log
+  SettingsStorage::saveFaultRecord(code, previousState, currentPosMm);
+
+  // 4. Alert user via TM1637 and finite buzzer pattern (no endless lockup tone!)
+  displayUI.showStatus("Err ");
+  displayUI.playErrorAlertPattern();
+}
+
 // ============================================================================
 // Per-State Update Handlers
 // ============================================================================
@@ -247,6 +295,13 @@ void StateMachine::updateSetupState() {
     if (setupMode_ == RETURN_POLICY_M) {
       setupMode_ = TRAVEL_DISTANCE_M;
       displayUI.showStatus("dist");
+    } else if (setupMode_ == TRAVEL_DISTANCE_M) {
+      setupMode_ = FAULT_HISTORY_M;
+      displayUI.showStatus("FLt ");
+      // Show fault mnemonic after brief label
+      FaultRecord rec = SettingsStorage::loadFaultRecord();
+      const char* mnemonic = SettingsStorage::getFaultMnemonic(static_cast<FaultCode>(rec.code));
+      displayUI.showStatus(mnemonic);
     } else {
       setupMode_ = RETURN_POLICY_M;
       displayUI.showStatus("rtrn");
@@ -262,6 +317,16 @@ void StateMachine::updateSetupState() {
         totalTravelDistanceMm_ -= TRAVEL_DISTANCE_STEP_MM;
       }
       displayUI.showFloat(totalTravelDistanceMm_, 1);
+    }
+  } else if (setupMode_ == FAULT_HISTORY_M) {
+    // Pressing Speed Down clears the fault history
+    if (inputManager.pollSpeedButtons()) {
+      elapsedMs_ = millis();
+      if (inputManager.isSpeedDownPressed()) {
+        SettingsStorage::clearFaultRecord();
+        displayUI.showStatus("nonE");
+        displayUI.playShortBeep();
+      }
     }
   } else {
     // RETURN_POLICY_M
@@ -334,6 +399,11 @@ void StateMachine::updateSetupState() {
 void StateMachine::updateStopState() {
   displayUI.silenceBuzzer();
 
+  // Safety short check before starting
+  if (SafetyMonitor::checkSwitchShort()) {
+    return;
+  }
+
   if (inputManager.pollSpeedButtons()) {
     enterRunningFromStop();
     return;
@@ -371,6 +441,17 @@ void StateMachine::updateWaitReturnState() {
 
 void StateMachine::updateRunningState() {
   const float lastRpm = platformDrive.getTargetRpm();
+
+  // 0. Hardware sanity checks (debounced)
+  if (SafetyMonitor::checkSwitchShort()) {
+    return;
+  }
+  const float distanceFromStartMm = (remainingDistanceMm_ > 0.0f)
+      ? (totalTravelDistanceMm_ - remainingDistanceMm_)
+      : travelDistanceMm_;
+  if (SafetyMonitor::checkUnexpectedStartSwitch(distanceFromStartMm)) {
+    return;
+  }
 
   // 1. Check end-of-travel Stop microswitch
   if (inputManager.checkStopSwitchTriggered()) {
@@ -466,19 +547,25 @@ void StateMachine::updateRunningState() {
         displayUI.updateCountdownBuzzer(remainingTimeSec);
       }
 
-      SafetyMonitor::checkHomedDeparture(
-          totalTravelDistanceMm_,
-          remainingDistanceMm_,
-          inputManager.isStartSwitchRawActive(),
-          RUNNING_FAULT_CODES);
+      if (SafetyMonitor::checkHomedDeparture(
+              totalTravelDistanceMm_,
+              remainingDistanceMm_,
+              inputManager.isStartSwitchRawActive(),
+              FAULT_START_SWITCH_STUCK)) {
+        return;
+      }
     } else {
       travelDistanceMm_ += PlatformDrive::computeLinearTravelMm(lastRpm, stepElapsedMs);
-      SafetyMonitor::checkUnhomedOrOverrun(
-          totalTravelDistanceMm_,
-          travelDistanceMm_,
-          remainingDistanceDone_,
-          inputManager.isStartSwitchRawActive(),
-          RUNNING_FAULT_CODES);
+      if (SafetyMonitor::checkUnhomedOrOverrun(
+              totalTravelDistanceMm_,
+              travelDistanceMm_,
+              remainingDistanceDone_,
+              inputManager.isStartSwitchRawActive(),
+              FAULT_START_SWITCH_STUCK,
+              FAULT_OVERTRAVEL_FORWARD,
+              ERROR_TRAVEL_DISTANCE_MM)) {
+        return;
+      }
     }
 
     if ((now - timeoutMs_) >= DISPLAY_TIMEOUT_MS) {
@@ -494,6 +581,11 @@ void StateMachine::updateRunningState() {
 }
 
 void StateMachine::updateFastForwardState() {
+  // Hardware sanity check
+  if (SafetyMonitor::checkSwitchShort()) {
+    return;
+  }
+
   if (inputManager.checkStopSwitchTriggered()) {
     enterWaitReturnState(true);
     displayUI.showStatus("push");
@@ -515,11 +607,24 @@ void StateMachine::updateFastForwardState() {
       effectiveRpm,
       true,
       inputManager.isStartSwitchRawActive(),
-      FAST_FORWARD_FAULT_CODES);
+      FAULT_START_SWITCH_STUCK,
+      FAULT_OVERTRAVEL_FORWARD,
+      END_ERROR_TRAVEL_DISTANCE_MM);
 }
 
 void StateMachine::updateReturnState() {
   displayUI.silenceBuzzer();
+
+  // Hardware sanity check
+  if (SafetyMonitor::checkSwitchShort()) {
+    return;
+  }
+  const float distanceFromStopMm = (remainingDistanceMm_ > 0.0f)
+      ? (totalTravelDistanceMm_ - remainingDistanceMm_)
+      : travelDistanceMm_;
+  if (SafetyMonitor::checkUnexpectedStopSwitch(distanceFromStopMm)) {
+    return;
+  }
 
   if (inputManager.checkStartSwitchTriggered()) {
     if (platformDrive.getTargetSpeedStepsPerSec() <= 0.0f) {
@@ -565,14 +670,18 @@ void StateMachine::updateReturnState() {
       effectiveRpm,
       false,
       inputManager.isStopSwitchRawActive(),
-      RETURN_FAULT_CODES);
+      FAULT_STOP_SWITCH_STUCK,
+      FAULT_OVERTRAVEL_RETURN,
+      END_ERROR_TRAVEL_DISTANCE_MM);
 }
 
 void StateMachine::updateFastMotionProgress(
     float effectivePositiveRpm,
     bool invertPercentage,
     bool isDepartureSwitchActive,
-    const MotionFaultCodes& faultCodes) {
+    FaultCode departureFault,
+    FaultCode overrunFault,
+    float overrunMarginMm) {
   const unsigned long now = millis();
 
   if ((now - timeoutMs_) >= DISPLAY_TIMEOUT_MS) {
@@ -605,19 +714,25 @@ void StateMachine::updateFastMotionProgress(
         startMs_               = now;
       }
 
-      SafetyMonitor::checkHomedDeparture(
-          totalTravelDistanceMm_,
-          remainingDistanceMm_,
-          isDepartureSwitchActive,
-          faultCodes);
+      if (SafetyMonitor::checkHomedDeparture(
+              totalTravelDistanceMm_,
+              remainingDistanceMm_,
+              isDepartureSwitchActive,
+              departureFault)) {
+        return;
+      }
     } else {
       travelDistanceMm_ += deltaMm;
-      SafetyMonitor::checkUnhomedOrOverrun(
-          totalTravelDistanceMm_,
-          travelDistanceMm_,
-          remainingDistanceDone_,
-          isDepartureSwitchActive,
-          faultCodes);
+      if (SafetyMonitor::checkUnhomedOrOverrun(
+              totalTravelDistanceMm_,
+              travelDistanceMm_,
+              remainingDistanceDone_,
+              isDepartureSwitchActive,
+              departureFault,
+              overrunFault,
+              overrunMarginMm)) {
+        return;
+      }
     }
 
     if ((now - timeoutMs_) >= DISPLAY_TIMEOUT_MS) {
@@ -625,5 +740,62 @@ void StateMachine::updateFastMotionProgress(
     }
 
     elapsedMs_ = now;
+  }
+}
+
+void StateMachine::updateErrorState() {
+  const unsigned long now = millis();
+
+  // 1. Alternate display every 1 second between "Err " and the 4-char mnemonic
+  if ((now - errorBlinkMs_) >= ERROR_BLINK_INTERVAL_MS) {
+    errorBlinkMs_ = now;
+    errorBlinkToggle_ = !errorBlinkToggle_;
+
+    if (errorBlinkToggle_) {
+      displayUI.showStatus("Err ");
+    } else {
+      displayUI.showStatus(SettingsStorage::getFaultMnemonic(activeFault_));
+    }
+  }
+
+  // 2. Periodic reminder chirp every 30 seconds unless muted
+  if (!errorChirpMuted_ && ((now - errorChirpMs_) >= ERROR_CHIRP_INTERVAL_MS)) {
+    errorChirpMs_ = now;
+    displayUI.playReminderChirp();
+  }
+
+  // 3. Any speed button press mutes the audio reminder
+  if (inputManager.pollSpeedButtons()) {
+    errorChirpMuted_ = true;
+    displayUI.silenceBuzzer();
+  }
+
+  // 4. Recoverable error exit: hold Reset button for 2 seconds
+  if (inputManager.isResetButtonRawActive()) {
+    if (resetHoldStartMs_ == 0) {
+      resetHoldStartMs_ = now;
+    } else if ((now - resetHoldStartMs_) >= RESET_HOLD_DELAY_MS) {
+      // Mark fault as acknowledged in EEPROM
+      SettingsStorage::acknowledgeFaultRecord();
+
+      // Clear fault and recover cleanly to STOP_ST ("rdy")
+      activeFault_           = FAULT_NONE;
+      remainingDistanceMm_   = 0.0f; // Clear uncalibrated assumption
+      travelDistanceMm_      = 0.0f;
+      remainingDistanceDone_ = false;
+      resetHoldStartMs_      = 0;
+      resetButtonHandled_    = true;
+
+      platformDrive.setTargetRpm(platformDrive.getNominalRpm());
+      platformDrive.applyTargetRpmToStepper();
+
+      state_ = STOP_ST;
+      displayUI.silenceBuzzer();
+      displayUI.showStatus("rdy");
+      displayUI.playShortBeep();
+      Serial.println(F("Recovered from error state -> STOP_ST (Ready)"));
+    }
+  } else {
+    resetHoldStartMs_ = 0;
   }
 }

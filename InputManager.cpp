@@ -74,6 +74,48 @@ bool InputManager::checkStopSwitchTriggered() {
   return false;
 }
 
+bool InputManager::checkBothSwitchesActiveDebounced() {
+  static uint8_t bothActiveCount = 0;
+  if ((digitalRead(PIN_SWITCH_START) == LOW) && (digitalRead(PIN_SWITCH_STOP) == LOW)) {
+    bothActiveCount++;
+    if (bothActiveCount >= SWITCH_DEBOUNCE_SAMPLES) {
+      bothActiveCount = 0;
+      return true;
+    }
+  } else {
+    bothActiveCount = 0;
+  }
+  return false;
+}
+
+bool InputManager::isStartSwitchDebouncedActive() {
+  static uint8_t count = 0;
+  if (digitalRead(PIN_SWITCH_START) == LOW) {
+    count++;
+    if (count >= SWITCH_DEBOUNCE_SAMPLES) {
+      count = SWITCH_DEBOUNCE_SAMPLES;
+      return true;
+    }
+  } else {
+    count = 0;
+  }
+  return false;
+}
+
+bool InputManager::isStopSwitchDebouncedActive() {
+  static uint8_t count = 0;
+  if (digitalRead(PIN_SWITCH_STOP) == LOW) {
+    count++;
+    if (count >= SWITCH_DEBOUNCE_SAMPLES) {
+      count = SWITCH_DEBOUNCE_SAMPLES;
+      return true;
+    }
+  } else {
+    count = 0;
+  }
+  return false;
+}
+
 bool InputManager::isStartSwitchRawActive() const {
   return digitalRead(PIN_SWITCH_START) == LOW;
 }

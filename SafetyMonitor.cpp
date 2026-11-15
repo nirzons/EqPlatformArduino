@@ -1,47 +1,73 @@
 #include "SafetyMonitor.h"
-#include "DisplayUI.h"
-#include "PlatformDrive.h"
+#include "InputManager.h"
+#include "StateMachine.h"
 
-void SafetyMonitor::checkHomedDeparture(
+bool SafetyMonitor::checkSwitchShort() {
+  if (inputManager.checkBothSwitchesActiveDebounced()) {
+    stateMachine.enterErrorState(FAULT_SWITCH_SHORT);
+    return true;
+  }
+  return false;
+}
+
+bool SafetyMonitor::checkUnexpectedStartSwitch(float distanceFromStartMm) {
+  if (distanceFromStartMm > (ERROR_TRAVEL_DISTANCE_MM * 2.0f)) {
+    if (inputManager.isStartSwitchDebouncedActive()) {
+      stateMachine.enterErrorState(FAULT_WRONG_DIRECTION);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SafetyMonitor::checkUnexpectedStopSwitch(float distanceFromStopMm) {
+  if (distanceFromStopMm > (ERROR_TRAVEL_DISTANCE_MM * 2.0f)) {
+    if (inputManager.isStopSwitchDebouncedActive()) {
+      stateMachine.enterErrorState(FAULT_WRONG_DIRECTION);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SafetyMonitor::checkHomedDeparture(
     float totalTravelMm,
     float remainingMm,
     bool isDepartureSwitchActive,
-    const MotionFaultCodes& codes) {
+    FaultCode departureFault) {
   if ((totalTravelMm - remainingMm) > ERROR_TRAVEL_DISTANCE_MM) {
     if (isDepartureSwitchActive) {
-      triggerFatalError(codes.stuckOnHomedDeparture);
+      stateMachine.enterErrorState(departureFault);
+      return true;
     }
   }
+  return false;
 }
 
-void SafetyMonitor::checkUnhomedOrOverrun(
+bool SafetyMonitor::checkUnhomedOrOverrun(
     float totalTravelMm,
     float traveledMm,
     bool remainingDistanceDone,
     bool isDepartureSwitchActive,
-    const MotionFaultCodes& codes) {
-  if (traveledMm > ERROR_TRAVEL_DISTANCE_MM) {
+    FaultCode departureFault,
+    FaultCode overrunFault,
+    float overrunMarginMm) {
+  if (!remainingDistanceDone && (traveledMm > ERROR_TRAVEL_DISTANCE_MM)) {
     if (isDepartureSwitchActive) {
-      triggerFatalError(codes.stuckOnUnhomedDeparture);
+      stateMachine.enterErrorState(departureFault);
+      return true;
     }
   }
 
-  if (traveledMm > (totalTravelMm + codes.overrunMarginMm)) {
-    triggerFatalError(codes.fullTravelOverrun);
+  if (traveledMm > (totalTravelMm + overrunMarginMm)) {
+    stateMachine.enterErrorState(overrunFault);
+    return true;
   }
 
-  if (remainingDistanceDone && (traveledMm > codes.overrunMarginMm)) {
-    triggerFatalError(codes.homedEndOverrun);
+  if (remainingDistanceDone && (traveledMm > overrunMarginMm)) {
+    stateMachine.enterErrorState(overrunFault);
+    return true;
   }
+
+  return false;
 }
-
-void SafetyMonitor::triggerFatalError(const char* errorCode) {
-  platformDrive.disableMotor();
-  platformDrive.stopTimer();
-  displayUI.showStatus(errorCode);
-  displayUI.playContinuousErrorTone();
-  while (true) {
-    // Halted until power cycle (recoverable ERROR_ST planned for Phase 2)
-  }
-}
-

@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 
-// Firmware version: 12 (Refactored modular architecture - Part A)
+// Firmware version: 13 (Modular architecture with Part B error handling)
 // Uncomment to enable Solar tracking rate in addition to Sidereal and Lunar:
 // #define SUN_RATE_SUPPORT
 
@@ -33,7 +33,8 @@ constexpr float TRAVEL_DISTANCE_STEP_MM   = 0.1f;
 // ============================================================================
 // EEPROM Layout
 // ============================================================================
-constexpr int EP_ADDR_TRAVEL_DISTANCE = 0;
+constexpr int EP_ADDR_TRAVEL_DISTANCE = 0;  // float (4 bytes, 0..3)
+constexpr int EP_ADDR_FAULT_RECORD    = 16; // FaultRecord struct (16..27)
 
 // ============================================================================
 // Mechanical & Kinematic Parameters (DO NOT MODIFY - Calibrated for Lat 32)
@@ -96,7 +97,7 @@ constexpr unsigned long SETUP_TIMEOUT_MS           = 8000UL; // Idle timeout to 
 constexpr unsigned long SETUP_COUNTDOWN_DELAY_MS   = 3000UL; // Show numeric countdown during last 3s of Setup
 constexpr unsigned long SETUP_COUNTDOWN_REFRESH_MS = 200UL;
 
-constexpr unsigned long RESET_HOLD_DELAY_MS        = 2000UL; // 2s hold: FF/Return chord or Rate toggle
+constexpr unsigned long RESET_HOLD_DELAY_MS        = 2000UL; // 2s hold: FF/Return chord, Rate toggle, or Error acknowledge
 constexpr unsigned long SETUP_ENTRY_HOLD_MS        = 2UL * RESET_HOLD_DELAY_MS; // 4s hold: Enter Setup
 
 constexpr uint8_t       DISPLAY_DEFAULT_BRIGHTNESS = 0;      // Dimmest level (0..7) to preserve night vision
@@ -110,6 +111,12 @@ constexpr unsigned int  BUZZER_FREQ_1MIN_HZ        = 600U;
 constexpr float         BUZZER_TIME_1MIN_SEC       = 1.0f * 60.0f;
 constexpr unsigned int  BUZZER_FREQ_15SEC_HZ       = 800U;
 constexpr float         BUZZER_TIME_15SEC_SEC      = 15.0f;
+
+// Error alert audio & timing parameters
+constexpr unsigned int  ERROR_BUZZER_FREQ_HZ       = 500U;
+constexpr unsigned long ERROR_BEEP_DURATION_MS     = 100UL;
+constexpr unsigned long ERROR_CHIRP_INTERVAL_MS    = 30000UL; // Periodic reminder chirp every 30s
+constexpr unsigned long ERROR_BLINK_INTERVAL_MS    = 1000UL;  // Alternate Err / Mnemonic every 1s
 
 constexpr unsigned long SERIAL_BAUD_RATE           = 9600UL;
 
@@ -143,16 +150,28 @@ enum PlatformState : uint8_t {
   FAST_FORWARD_ST,
   RETURN_ST,
   WAIT_RETURN_ST,
-  STOP_ST
+  STOP_ST,
+  ERROR_ST
 };
 
 enum SetupMode : uint8_t {
   RETURN_POLICY_M = 0,
-  TRAVEL_DISTANCE_M
+  TRAVEL_DISTANCE_M,
+  FAULT_HISTORY_M
+};
+
+// Distinct physical fault codes
+enum FaultCode : uint8_t {
+  FAULT_NONE = 0,
+  FAULT_START_SWITCH_STUCK, // StSt - Start switch did not clear after moving forward
+  FAULT_STOP_SWITCH_STUCK,  // StSP - Stop switch did not clear after moving reverse
+  FAULT_OVERTRAVEL_FORWARD, // ovFd - Stop switch never triggered at end of forward travel
+  FAULT_OVERTRAVEL_RETURN,  // ovRt - Start switch never triggered at end of return travel
+  FAULT_SWITCH_SHORT,       // SwSh - Both Start and Stop switches read active simultaneously
+  FAULT_WRONG_DIRECTION     // dirE - Reached opposite limit switch unexpected for motion
 };
 
 constexpr ReturnPolicy  DEFAULT_RETURN_POLICY  = AUTO_RT;
 constexpr PlatformState INITIAL_PLATFORM_STATE = STOP_ST;
 
 #endif // CONFIG_H
-
