@@ -19,7 +19,7 @@ void DisplayUI::begin() {
   display_.setBrightness(DISPLAY_DEFAULT_BRIGHTNESS);
 }
 
-void DisplayUI::reset(PlatformState currentState) {
+__attribute__((noinline)) void DisplayUI::reset(PlatformState currentState) {
   buzzerStage_ = 0;
   noTone(PIN_BUZZER);
 
@@ -32,12 +32,14 @@ void DisplayUI::reset(PlatformState currentState) {
     display_.showString("Stup");
   } else if (currentState == ERROR_ST) {
     display_.showString("Err ");
+  } else if (currentState == HOMING_ST) {
+    display_.showString("homE");
   } else {
     display_.showString("rdy");
   }
 }
 
-void DisplayUI::showStatus(const char* msg) {
+__attribute__((noinline)) void DisplayUI::showStatus(const char* msg) {
   display_.showString(msg);
 }
 
@@ -45,18 +47,23 @@ void DisplayUI::showInteger(int value) {
   display_.showNumber(value);
 }
 
-void DisplayUI::showFloat(float value, uint8_t decimalPlaces) {
+__attribute__((noinline)) void DisplayUI::showFloat(float value, uint8_t decimalPlaces) {
   display_.showNumber(value, decimalPlaces);
 }
 
-void DisplayUI::showTimeMmSs(long totalSeconds) {
-  const long mins = totalSeconds / 60L;
-  const long secs = totalSeconds % 60L;
-  display_.showNumberDec(mins * 100L + secs, DISPLAY_COLON_MASK, true);
+__attribute__((noinline)) void DisplayUI::showTimeMmSs(long totalSeconds) {
+  if (totalSeconds < 0L) {
+    totalSeconds = 0L;
+  } else if (totalSeconds > 5999L) {
+    totalSeconds = 5999L;
+  }
+  const int mins = static_cast<int>(totalSeconds / 60L);
+  const int secs = static_cast<int>(totalSeconds % 60L);
+  display_.showNumberDec(mins * 100 + secs, DISPLAY_COLON_MASK, true);
 }
 
 void DisplayUI::showTravelDistance(float totalTravelMm, float remainingMm, float traveledMm) {
-  display_.showNumber(totalTravelMm - remainingMm + traveledMm, 1);
+  showFloat(totalTravelMm - remainingMm + traveledMm, 1);
   Serial.print(traveledMm);
   Serial.print(F(" , "));
   Serial.println(remainingMm);
@@ -70,20 +77,21 @@ void DisplayUI::cycleDisplayMode() {
   displayMode_ = static_cast<DisplayMode>(next);
 }
 
-void DisplayUI::showProgressView(float percentage, long deltaSeconds, bool hasRemainingDistance) {
+__attribute__((noinline)) void DisplayUI::showProgressView(float percentage, long deltaSeconds, bool hasRemainingDistance) {
   if (displayModeTogglePending_) {
     displayModeTogglePending_ = false;
     cycleDisplayMode();
   }
 
+  const int clampedPct = static_cast<int>(constrain(percentage, 0.0f, 100.0f));
   if ((displayMode_ == TIME_D) || !hasRemainingDistance) {
     showTimeMmSs(deltaSeconds);
   } else if (displayMode_ == PERCENTAGE_D) {
     display_.showString("%", 1, 3);
-    display_.showNumber(static_cast<int>(percentage), false, 3, 0);
+    display_.showNumber(clampedPct, false, 3, 0);
   } else {
     // BAR_D
-    display_.showLevel(DISPLAY_BAR_MIN_LEVEL + static_cast<int>(percentage), false);
+    display_.showLevel(DISPLAY_BAR_MIN_LEVEL + clampedPct, false);
   }
 }
 
@@ -102,7 +110,7 @@ void DisplayUI::playEasterEgg() {
   display_.showString("Program by Nir Zonshine");
 }
 
-void DisplayUI::silenceBuzzer() {
+__attribute__((noinline)) void DisplayUI::silenceBuzzer() {
   noTone(PIN_BUZZER);
 }
 
@@ -110,8 +118,52 @@ void DisplayUI::resetCountdownBuzzer() {
   buzzerStage_ = 0;
 }
 
-void DisplayUI::playShortBeep() {
+__attribute__((noinline)) void DisplayUI::playShortBeep() {
   tone(PIN_BUZZER, BUZZER_FREQ_5MIN_HZ, BUZZER_DURATION_MS);
+}
+
+__attribute__((noinline)) void DisplayUI::playDoubleBeep() {
+  tone(PIN_BUZZER, BUZZER_FREQ_1MIN_HZ, 50);
+  delay(80);
+  tone(PIN_BUZZER, BUZZER_FREQ_1MIN_HZ, 50);
+}
+
+__attribute__((noinline)) void DisplayUI::playLowRejectBeep() {
+  tone(PIN_BUZZER, 300, 200);
+}
+
+void DisplayUI::playRateTone(TrackingRate rate) {
+  if (rate == SIDEREAL_RATE) {
+    tone(PIN_BUZZER, 800, 50);
+  }
+#ifdef SUN_RATE_SUPPORT
+  else if (rate == SUN_RATE) {
+    tone(PIN_BUZZER, 650, 65);
+  }
+#endif
+  else {
+    tone(PIN_BUZZER, 500, 80);
+  }
+}
+
+void DisplayUI::playParkSuccessTone() {
+  tone(PIN_BUZZER, 600, 80);
+  delay(100);
+  tone(PIN_BUZZER, 900, 150);
+}
+
+void DisplayUI::playSaveTone() {
+  tone(PIN_BUZZER, 700, 80);
+  delay(100);
+  tone(PIN_BUZZER, 1000, 120);
+}
+
+void DisplayUI::playAdaptiveTuneChime() {
+  tone(PIN_BUZZER, 600, 70);
+  delay(90);
+  tone(PIN_BUZZER, 800, 70);
+  delay(90);
+  tone(PIN_BUZZER, 1000, 120);
 }
 
 void DisplayUI::playContinuousErrorTone() {
@@ -159,4 +211,30 @@ void DisplayUI::flashBootFault(const char* mnemonic) {
     showStatus(mnemonic);
     delay(500);
   }
+}
+
+void DisplayUI::flashParkConfirmation() {
+  showStatus("PArk");
+  playParkSuccessTone();
+  delay(1000);
+  showStatus("OFF ");
+}
+
+void DisplayUI::flashResumeNotification() {
+  showStatus("rESt");
+  playDoubleBeep();
+  delay(1200);
+  showStatus("rdy");
+}
+
+__attribute__((noinline)) void DisplayUI::flashCalibrationSaved() {
+  showStatus("SAVd");
+  playSaveTone();
+  delay(1200);
+}
+
+__attribute__((noinline)) void DisplayUI::flashUnhomedReject() {
+  showStatus("noHm");
+  playLowRejectBeep();
+  delay(1200);
 }

@@ -14,7 +14,6 @@ PlatformDrive::PlatformDrive()
     : stepper_(STEPPER_DRIVER_INTERFACE, PIN_STEPPER_STEP, PIN_STEPPER_DIR),
       pushArchRadius_(PUSH_ARCH_RADIUS_MM),
       angularVelocity_(SIDEREAL_ANGULAR_VELOCITY),
-      originalAngularVelocity_(SIDEREAL_ANGULAR_VELOCITY),
       nominalRpm_(0.0f),
       nominalRpmOffset_(0.0f),
       targetRpm_(0.0f),
@@ -45,7 +44,6 @@ void PlatformDrive::resetParameters(float remainingDistanceMm, float totalTravel
   Serial.println(nominalRpm_);
 
   fixTargetRpmForLocation(remainingDistanceMm, totalTravelDistanceMm);
-  originalAngularVelocity_ = angularVelocity_;
 
   returnRpm_        = DEFAULT_RETURN_RPM;
   returnRpmStepDir_ = -1;
@@ -82,13 +80,13 @@ void PlatformDrive::stopTimer() {
   Timer1.stop();
 }
 
-void PlatformDrive::recalculateNominalRpm() {
+__attribute__((noinline)) void PlatformDrive::recalculateNominalRpm() {
   const float gearRatio = static_cast<float>(ROD_GEAR_TEETH) / static_cast<float>(MOTOR_GEAR_TEETH);
   nominalRpm_       = angularVelocity_ * pushArchRadius_ * gearRatio;
   nominalRpmOffset_ = angularVelocity_ * RADIUS_OFFSET_MM * gearRatio;
 }
 
-void PlatformDrive::fixTargetRpmForLocation(float remainingDistanceMm, float totalTravelDistanceMm) {
+__attribute__((noinline)) void PlatformDrive::fixTargetRpmForLocation(float remainingDistanceMm, float totalTravelDistanceMm) {
   float distanceRatio = remainingDistanceMm - (totalTravelDistanceMm / 2.0f);
   if (distanceRatio > 0.0f) {
     distanceRatio = distanceRatio / (pushArchRadius_ - RADIUS_OFFSET_MM); // tan(alpha)
@@ -99,7 +97,7 @@ void PlatformDrive::fixTargetRpmForLocation(float remainingDistanceMm, float tot
   }
 }
 
-void PlatformDrive::applyRpmToStepper(float rpm) {
+__attribute__((noinline)) void PlatformDrive::applyRpmToStepper(float rpm) {
   targetSpeedStepsPerSec_ = (rpm * STEPS_PER_REVOLUTION) / 60.0f;
 
   const uint8_t oldSREG = SREG;
@@ -113,17 +111,32 @@ void PlatformDrive::applyTargetRpmToStepper() {
 }
 
 TrackingRate PlatformDrive::cycleTrackingRate(float remainingDistanceMm, float totalTravelDistanceMm) {
+  TrackingRate nextRate = SIDEREAL_RATE;
   if (trackingRate_ == SIDEREAL_RATE) {
-    angularVelocity_ = MOON_ANGULAR_VELOCITY;
-    trackingRate_    = MOON_RATE;
-    Serial.println(F("Moon"));
-  } else if (trackingRate_ == MOON_RATE) {
+    nextRate = MOON_RATE;
+  }
 #ifdef SUN_RATE_SUPPORT
-    angularVelocity_ = SUN_ANGULAR_VELOCITY;
-    trackingRate_    = SUN_RATE;
-    Serial.println(F("Sun"));
-  } else {
+  else if (trackingRate_ == MOON_RATE) {
+    nextRate = SUN_RATE;
+  }
 #endif
+  setTrackingRate(nextRate, remainingDistanceMm, totalTravelDistanceMm);
+  return trackingRate_;
+}
+
+__attribute__((noinline)) void PlatformDrive::setTrackingRate(TrackingRate rate, float remainingDistanceMm, float totalTravelDistanceMm) {
+  trackingRate_ = rate;
+  if (trackingRate_ == MOON_RATE) {
+    angularVelocity_ = MOON_ANGULAR_VELOCITY;
+    Serial.println(F("Moon"));
+  }
+#ifdef SUN_RATE_SUPPORT
+  else if (trackingRate_ == SUN_RATE) {
+    angularVelocity_ = SUN_ANGULAR_VELOCITY;
+    Serial.println(F("Sun"));
+  }
+#endif
+  else {
     angularVelocity_ = SIDEREAL_ANGULAR_VELOCITY;
     trackingRate_    = SIDEREAL_RATE;
     Serial.println(F("Sidereal"));
@@ -132,27 +145,19 @@ TrackingRate PlatformDrive::cycleTrackingRate(float remainingDistanceMm, float t
   recalculateNominalRpm();
   fixTargetRpmForLocation(remainingDistanceMm, totalTravelDistanceMm);
   applyTargetRpmToStepper();
-  return trackingRate_;
 }
 
 void PlatformDrive::adjustAngularVelocity(float deltaRadPerMin, float remainingDistanceMm, float totalTravelDistanceMm) {
-  angularVelocity_ += deltaRadPerMin;
+  angularVelocity_ = constrain(
+      angularVelocity_ + deltaRadPerMin,
+      SIDEREAL_ANGULAR_VELOCITY * 0.5f,
+      SIDEREAL_ANGULAR_VELOCITY * 1.5f);
   recalculateNominalRpm();
   fixTargetRpmForLocation(remainingDistanceMm, totalTravelDistanceMm);
   applyTargetRpmToStepper();
 
   Serial.print(F("New angular velocity: "));
   Serial.println(angularVelocity_ * 1000000.0f);
-}
-
-void PlatformDrive::saveAngularVelocitySnapshot() {
-  originalAngularVelocity_ = angularVelocity_;
-}
-
-void PlatformDrive::restoreAngularVelocitySnapshot(float remainingDistanceMm, float totalTravelDistanceMm) {
-  angularVelocity_ = originalAngularVelocity_;
-  recalculateNominalRpm();
-  fixTargetRpmForLocation(remainingDistanceMm, totalTravelDistanceMm);
 }
 
 float PlatformDrive::cycleReturnRpm() {
@@ -167,12 +172,15 @@ float PlatformDrive::cycleReturnRpm() {
   return returnRpm_;
 }
 
-float PlatformDrive::computeLinearTravelMm(float rpm, unsigned long elapsedMs) {
+__attribute__((noinline)) float PlatformDrive::computeLinearTravelMm(float rpm, unsigned long elapsedMs) {
   const float invGearRatio = static_cast<float>(MOTOR_GEAR_TEETH) / static_cast<float>(ROD_GEAR_TEETH);
   return rpm * invGearRatio * static_cast<float>(elapsedMs) / 60000.0f;
 }
 
-float PlatformDrive::computeRemainingTimeSec(float remainingDistanceMm, float effectiveRpm) {
+__attribute__((noinline)) float PlatformDrive::computeRemainingTimeSec(float remainingDistanceMm, float effectiveRpm) {
+  if (remainingDistanceMm <= 0.0f || effectiveRpm <= 0.0001f) {
+    return 0.0f;
+  }
   const float invGearRatio = static_cast<float>(MOTOR_GEAR_TEETH) / static_cast<float>(ROD_GEAR_TEETH);
   return (remainingDistanceMm / (effectiveRpm * invGearRatio)) * 60.0f;
 }

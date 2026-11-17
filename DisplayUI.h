@@ -33,6 +33,12 @@ public:
   void silenceBuzzer();
   void resetCountdownBuzzer();
   void playShortBeep();
+  void playDoubleBeep();
+  void playLowRejectBeep();
+  void playRateTone(TrackingRate rate);
+  void playParkSuccessTone();
+  void playSaveTone();
+  void playAdaptiveTuneChime();
   void playContinuousErrorTone();
   void updateCountdownBuzzer(float remainingTimeSec);
 
@@ -41,6 +47,12 @@ public:
   void playBootFaultAlarm();            // Multi-tone boot warning for unacknowledged faults
   void playReminderChirp();             // Brief 30s reminder chirp
   void flashBootFault(const char* mnemonic); // Flash Err / Mnemonic with audible alarm on boot
+
+  // Phase 3 UI alerts & confirmations
+  void flashParkConfirmation();         // Flashes PArk, plays chime, shows OFF
+  void flashResumeNotification();       // Flashes rESt for 1.5s
+  void flashCalibrationSaved();         // Flashes SAVd for 1.5s
+  void flashUnhomedReject();            // Flashes noHm when park attempted unhomed
 
 private:
   void cycleDisplayMode();

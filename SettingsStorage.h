@@ -3,7 +3,7 @@
 
 #include "Config.h"
 
-// Stored in EEPROM at EP_ADDR_FAULT_RECORD
+// Stored in EEPROM at EP_ADDR_FAULT_RECORD (address 16, 12 bytes)
 struct FaultRecord {
   uint16_t magic;         // 0x464C ("FL") indicates valid record
   uint8_t  code;          // FaultCode enum
@@ -12,6 +12,15 @@ struct FaultRecord {
   uint8_t  acknowledged;  // 0 = unacknowledged (causes boot alarm), 1 = acknowledged
   uint8_t  reserved;      // Alignment padding
   uint16_t checksum;      // Simple checksum for data validation
+};
+
+// Stored in EEPROM at EP_ADDR_PARK_RECORD (address 32, 10 bytes)
+struct ParkRecord {
+  uint16_t magic;         // 0x4551 ("EQ") indicates valid park record
+  float    remainingMm;   // Valid remaining tracking distance in mm
+  uint8_t  trackingRate;  // TrackingRate enum
+  uint8_t  reserved;      // Padding
+  uint16_t checksum;      // Checksum
 };
 
 class SettingsStorage {
@@ -29,15 +38,14 @@ public:
   static void acknowledgeFaultRecord();
   static void clearFaultRecord();
 
+  // Park & Resume position in EEPROM
+  static bool hasValidParkRecord();
+  static ParkRecord loadParkRecord();
+  static void saveParkRecord(float remainingMm, TrackingRate rate);
+  static void clearParkRecord();
+
   // Converts FaultCode to 4-character display mnemonic (e.g. "StSt", "ovFd", "nonE")
   static const char* getFaultMnemonic(FaultCode code);
-  // Returns human-readable description for Serial logs
-  static const char* getFaultDescription(FaultCode code);
-  // Returns legacy error code string (e.g. "Err1", "Err3") for backward compatibility
-  static const char* getLegacyErrorCode(FaultCode code, PlatformState state);
-
-  // Check if an unacknowledged fault exists from previous run
-  static bool hasUnacknowledgedFault();
 };
 
 #endif // SETTINGS_STORAGE_H

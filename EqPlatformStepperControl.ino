@@ -1,7 +1,7 @@
 // ============================================================================
 // Equatorial Platform Stepper Controller (Latitude 32)
 // Author: Nir Zonshine
-// Version 12 (Refactored Modular Architecture)
+// Version 14 (Refactored Modular Architecture)
 // ============================================================================
 
 #include "Config.h"

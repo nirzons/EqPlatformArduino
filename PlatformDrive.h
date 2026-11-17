@@ -39,12 +39,11 @@ public:
   // Cycles Sidereal -> Lunar (-> Solar if enabled) -> Sidereal and updates target RPM.
   TrackingRate cycleTrackingRate(float remainingDistanceMm, float totalTravelDistanceMm);
 
+  // Explicitly sets tracking rate (Sidereal, Moon, Sun) and updates target RPM.
+  void setTrackingRate(TrackingRate rate, float remainingDistanceMm, float totalTravelDistanceMm);
+
   // Fine-tunes angular velocity by +/- ANGULAR_VELOCITY_STEP during tracking.
   void adjustAngularVelocity(float deltaRadPerMin, float remainingDistanceMm, float totalTravelDistanceMm);
-
-  // Saves/restores angular velocity around speed-button hold gestures (FF / Return).
-  void saveAngularVelocitySnapshot();
-  void restoreAngularVelocitySnapshot(float remainingDistanceMm, float totalTravelDistanceMm);
 
   // Cycles return speed in Setup mode between -320, -240, -160, and -80 RPM.
   float cycleReturnRpm();
@@ -70,7 +69,6 @@ private:
   AccelStepper stepper_;
   float        pushArchRadius_;
   float        angularVelocity_;
-  float        originalAngularVelocity_;
   float        nominalRpm_;
   float        nominalRpmOffset_;
   float        targetRpm_;

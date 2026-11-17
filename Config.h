@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 
-// Firmware version: 13 (Modular architecture with Part B error handling)
+// Firmware version: 14 (Phase 3: Precision Homing, Park/Resume, Adaptive Calibration)
 // Uncomment to enable Solar tracking rate in addition to Sidereal and Lunar:
 // #define SUN_RATE_SUPPORT
 
@@ -34,7 +34,8 @@ constexpr float TRAVEL_DISTANCE_STEP_MM   = 0.1f;
 // EEPROM Layout
 // ============================================================================
 constexpr int EP_ADDR_TRAVEL_DISTANCE = 0;  // float (4 bytes, 0..3)
-constexpr int EP_ADDR_FAULT_RECORD    = 16; // FaultRecord struct (16..27)
+constexpr int EP_ADDR_FAULT_RECORD    = 16; // FaultRecord struct (12 bytes, 16..27)
+constexpr int EP_ADDR_PARK_RECORD     = 32; // ParkRecord struct (10 bytes, 32..41)
 
 // ============================================================================
 // Mechanical & Kinematic Parameters (DO NOT MODIFY - Calibrated for Lat 32)
@@ -59,6 +60,19 @@ constexpr float ANGULAR_VELOCITY_STEP     = 0.000001f;      // Manual fine speed
 constexpr float DEFAULT_RETURN_RPM        = -320.0f;
 constexpr float RETURN_RPM_STEP           = 80.0f;
 constexpr float FAST_MOVEMENT_FIX_RATIO   = 0.97f;
+
+// Homing & calibration speeds
+constexpr float HOMING_CLEAR_RPM          = 160.0f; // Brisk forward speed to clear switch
+constexpr float HOMING_CREEP_RPM          = -160.0f; // Reverse speed to trip switch cleanly
+constexpr float MAX_HOMING_CLEAR_MM       = 6.0f;   // Safety cap on forward clear travel
+constexpr float HOMING_OVER_CLEAR_MM      = 0.8f;   // Margin past switch release point
+constexpr float FAST_CALIBRATION_RPM      = 80.0f;  // Gentle, safe speed for Fast Calibration
+
+// Adaptive calibration thresholds
+constexpr float ADAPTIVE_MIN_DELTA_MM     = 0.1f;   // Minimum deviation to apply filter
+constexpr float ADAPTIVE_MAX_DELTA_MM     = 5.0f;   // Max deviation (outlier rejection threshold)
+constexpr float ADAPTIVE_FILTER_GAIN      = 0.33f;  // 33% step toward measured error
+constexpr float ADAPTIVE_ALERT_DELTA_MM   = 0.5f;   // Flash CAL alert on pause if deviation >= 0.5 mm
 
 // Safety travel error thresholds (mm)
 constexpr float ERROR_TRAVEL_DISTANCE_MM     = 2.7f;
@@ -97,8 +111,14 @@ constexpr unsigned long SETUP_TIMEOUT_MS           = 8000UL; // Idle timeout to 
 constexpr unsigned long SETUP_COUNTDOWN_DELAY_MS   = 3000UL; // Show numeric countdown during last 3s of Setup
 constexpr unsigned long SETUP_COUNTDOWN_REFRESH_MS = 200UL;
 
-constexpr unsigned long RESET_HOLD_DELAY_MS        = 2000UL; // 2s hold: FF/Return chord, Rate toggle, or Error acknowledge
-constexpr unsigned long SETUP_ENTRY_HOLD_MS        = 2UL * RESET_HOLD_DELAY_MS; // 4s hold: Enter Setup
+constexpr unsigned long BUTTON_DEBOUNCE_MS         = 25UL;   // Contact bounce filter duration
+constexpr unsigned long TAP_MIN_DURATION_MS        = 30UL;   // Minimum valid tap press duration
+constexpr unsigned long TAP_MAX_DURATION_MS        = 500UL;  // <0.5s = Short tap
+constexpr unsigned long RATE_TOGGLE_MIN_HOLD_MS    = 1500UL; // 1.5s - 3.0s release = Rate Toggle
+constexpr unsigned long RATE_TOGGLE_MAX_HOLD_MS    = 3000UL;
+constexpr unsigned long SETUP_ENTRY_HOLD_MS        = 3500UL; // >=3.5s hold (fires while held) = Enter Setup
+constexpr unsigned long SLEW_HOLD_DELAY_MS         = 2000UL; // 2s hold for fast movement in STOP_ST
+constexpr unsigned long PARK_CHORD_HOLD_MS         = 2000UL; // 2s hold for Reset + Speed Down = Park
 
 constexpr uint8_t       DISPLAY_DEFAULT_BRIGHTNESS = 0;      // Dimmest level (0..7) to preserve night vision
 constexpr uint8_t       DISPLAY_COLON_MASK         = 0b01000000;
@@ -151,13 +171,17 @@ enum PlatformState : uint8_t {
   RETURN_ST,
   WAIT_RETURN_ST,
   STOP_ST,
-  ERROR_ST
+  ERROR_ST,
+  HOMING_ST,
+  CALIBRATION_ST
 };
 
 enum SetupMode : uint8_t {
   RETURN_POLICY_M = 0,
   TRAVEL_DISTANCE_M,
-  FAULT_HISTORY_M
+  FAULT_HISTORY_M,
+  ADAPTIVE_CAL_M,
+  CALIBRATION_M
 };
 
 // Distinct physical fault codes
